@@ -128,14 +128,20 @@ class FBAgent:
         temporary.replace(path)
 
     def _synchronize_step(self, loss, optimizer, parameters):
-        parameters = list(parameters)
+        optimizer.zero_grad(set_to_none=True)
+        self._backward_loss(loss)
+        return self._step_accumulated_gradients(optimizer, parameters)
+
+    def _backward_loss(self, loss):
         finite = torch.isfinite(loss.detach()).float()
         if self.world_size > 1:
             distributed.all_reduce(finite, op=distributed.ReduceOp.MIN)
         if not finite.item():
             raise FloatingPointError("Nonfinite FB training loss on one or more ranks")
-        optimizer.zero_grad(set_to_none=True)
         loss.backward()
+
+    def _step_accumulated_gradients(self, optimizer, parameters):
+        parameters = list(parameters)
         gradients = [parameter.grad.reshape(-1) for parameter in parameters if parameter.grad is not None]
         packed = torch.cat(gradients)
         if self.world_size > 1:

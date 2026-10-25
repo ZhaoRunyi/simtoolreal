@@ -482,6 +482,10 @@ class FBcprAgent(FBAgent):
         for parameter in critics:
             parameter.requires_grad_(False)
         actor_loss, q_fb, q_style, q_auxiliary = self._actor_objective(state, history, command)
+        self.actor_optimizer.zero_grad(set_to_none=True)
+        self._backward_loss(actor_loss)
+        actor_loss = actor_loss.detach()
+        q_fb, q_style, q_auxiliary = q_fb.detach(), q_style.detach(), q_auxiliary.detach()
         if self.options.get('logo_coefficient', 0) > 0:
             window = self.replay.sample_window(count, self.options['logo_horizon'])
             available = torch.tensor(int(window is not None), device=self.device)
@@ -496,12 +500,18 @@ class FBcprAgent(FBAgent):
                     local_command = self.model.backward(self.state_normalizer(window['local_state']))
                     goal_command = self.model.backward(self.state_normalizer(window['goal_state']))
                 local_loss = self._actor_objective(local_state, local_history, local_command)[0]
+                # Backpropagate each term before constructing the next graph.
+                # Accumulate the same weighted sum, then synchronize/clip/step once.
+                self._backward_loss(self.options['logo_coefficient'] * self.options['logo_local_weight'] * local_loss)
+                local_loss = local_loss.detach()
                 goal_loss = self._actor_objective(local_state, local_history, goal_command)[0]
+                self._backward_loss(self.options['logo_coefficient'] * self.options['logo_goal_weight'] * goal_loss)
+                goal_loss = goal_loss.detach()
                 pair_loss = self.options['logo_local_weight'] * local_loss + self.options['logo_goal_weight'] * goal_loss
                 actor_loss = actor_loss + self.options['logo_coefficient'] * pair_loss
                 metrics.update({'loss/logo_local': local_loss.detach(), 'loss/logo_goal': goal_loss.detach(),
                                 'loss/logo_scaled': self.options['logo_coefficient'] * pair_loss.detach()})
-        actor_grad = self._synchronize_step(actor_loss, self.actor_optimizer, self.model.actor.parameters())
+        actor_grad = self._step_accumulated_gradients(self.actor_optimizer, self.model.actor.parameters())
         for parameter in critics:
             parameter.requires_grad_(True)
         with torch.no_grad():

@@ -118,3 +118,33 @@ def test_diagnostics_real_checkpoint_replay_to_report(tmp_path, monkeypatch):
     assert report['sample_count'] == 24
     assert (tmp_path / 'report/sample.pt').exists()
     assert (tmp_path / 'report/outputs.pt').exists()
+
+
+def test_sequential_logo_gradients_and_step_match_joint_objective(tmp_path):
+    import copy
+    agent = make_agent(tmp_path)
+    agent.model.local_prompt = True
+    for name in ('forward_maps', 'style_maps', 'auxiliary_maps'):
+        getattr(agent.model, name).requires_grad_(False)
+    joint = copy.deepcopy(agent)
+    state = torch.randn(8, 20)
+    history = torch.randn(8, 67)
+    commands = [torch.randn(8, 4) for _ in range(3)]
+    weights = [1., .005 * 4 / 7, .005 * 3 / 7]
+    torch.manual_seed(316)
+    agent.actor_optimizer.zero_grad(set_to_none=True)
+    for command, weight in zip(commands, weights):
+        loss = agent._actor_objective(state, history, command)[0]
+        agent._backward_loss(weight * loss)
+    sequential_gradients = [parameter.grad.clone() for parameter in agent.model.actor.parameters()]
+    sequential_norm = agent._step_accumulated_gradients(agent.actor_optimizer, agent.model.actor.parameters())
+    torch.manual_seed(316)
+    joint_loss = sum(weight * joint._actor_objective(state, history, command)[0]
+                     for command, weight in zip(commands, weights))
+    joint_norm = joint._synchronize_step(joint_loss, joint.actor_optimizer, joint.model.actor.parameters())
+    torch.testing.assert_close(sequential_norm, joint_norm, rtol=1e-5, atol=1e-6)
+    for gradient, parameter in zip(sequential_gradients, joint.model.actor.parameters()):
+        torch.testing.assert_close(gradient, parameter.grad, rtol=2e-5, atol=2e-6)
+    for parameter, reference in zip(agent.model.actor.parameters(), joint.model.actor.parameters()):
+        torch.testing.assert_close(parameter, reference, rtol=1e-5, atol=1e-6)
+    assert all(int(value['step']) == 1 for value in agent.actor_optimizer.state.values())
