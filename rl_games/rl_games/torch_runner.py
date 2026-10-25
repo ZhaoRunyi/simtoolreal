@@ -14,6 +14,7 @@ from rl_games.algos_torch import players
 from rl_games.common.algo_observer import DefaultAlgoObserver
 from rl_games.algos_torch import sac_agent
 from rl_games.algos_torch import fb_agent
+from rl_games.algos_torch import fb_cpr_agent
 from rl_games.algos_torch import torch_ext
 
 
@@ -62,6 +63,7 @@ class Runner:
         self.algo_factory.register_builder('a2c_continuous', lambda **kwargs : a2c_continuous.A2CAgent(**kwargs))
         self.algo_factory.register_builder('a2c_discrete', lambda **kwargs : a2c_discrete.DiscreteA2CAgent(**kwargs)) 
         self.algo_factory.register_builder('sac', lambda **kwargs: sac_agent.SACAgent(**kwargs))
+        self.algo_factory.register_builder('fb_cpr', lambda **kwargs: fb_cpr_agent.FBcprAgent(**kwargs))
         self.algo_factory.register_builder('fb', lambda **kwargs: fb_agent.FBAgent(**kwargs))
         #self.algo_factory.register_builder('dqn', lambda **kwargs : dqnagent.DQNAgent(**kwargs))
 
@@ -69,6 +71,7 @@ class Runner:
         self.player_factory.register_builder('a2c_continuous', lambda **kwargs : players.PpoPlayerContinuous(**kwargs))
         self.player_factory.register_builder('a2c_discrete', lambda **kwargs : players.PpoPlayerDiscrete(**kwargs))
         self.player_factory.register_builder('sac', lambda **kwargs : players.SACPlayer(**kwargs))
+        self.player_factory.register_builder('fb_cpr', lambda **kwargs: fb_cpr_agent.FBcprPlayer(**kwargs))
         self.player_factory.register_builder('fb', lambda **kwargs: fb_agent.FBPlayer(**kwargs))
         #self.player_factory.register_builder('dqn', lambda **kwargs : players.DQNPlayer(**kwargs))
 

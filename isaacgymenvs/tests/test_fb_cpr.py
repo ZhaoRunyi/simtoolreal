@@ -1,0 +1,92 @@
+"""CPR update, replay and expert-sequence contracts without simulator dependencies."""
+
+from types import SimpleNamespace
+
+import gym
+import torch
+
+from rl_games.algos_torch.fb_cpr_agent import FBcprAgent
+from rl_games.algos_torch.fb_cpr_networks import ExpertSequences, TransitionReplay
+
+
+def test_transition_replay_excludes_reset_rows_and_keeps_pairs():
+    replay = TransitionReplay(24, 3, 4, 'cpu')
+    for offset in range(3):
+        state = torch.arange(12).reshape(4, 3, 1).float() + 100 * offset
+        valid = torch.ones_like(state, dtype=torch.bool)
+        valid[0] = False
+        replay.add({'state': state, 'next_state': state + 1, 'valid': valid})
+    sample = replay.sample(1000)
+    assert sample['valid'].all()
+    assert sample['state'].min() >= 103
+    torch.testing.assert_close(sample['next_state'], sample['state'] + 1)
+
+
+def test_expert_slices_never_cross_episode_or_environment():
+    state = torch.arange(30)[:, None, None].expand(30, 3, 1).float()
+    state = state + 100 * torch.arange(3)[None, :, None]
+    valid = torch.ones(30, 3, dtype=torch.bool)
+    valid[15] = False
+    experts = ExpertSequences(state, valid)
+    sample = experts.sample(1000, 8)
+    torch.testing.assert_close(sample[:, 1:] - sample[:, :-1], torch.ones(1000, 7, 1))
+    assert not ((sample % 100) == 15).any()
+
+
+def make_agent(tmp_path):
+    metadata = SimpleNamespace(obs_list=['keypoints_rel_goal', 'joint_pos'],
+                               obs_type_size_dict={'keypoints_rel_goal': 12, 'joint_pos': 4})
+    vector = SimpleNamespace(env=metadata, get_env_info=lambda: {
+        'observation_space': gym.spaces.Box(-10, 10, (16,)),
+        'state_space': gym.spaces.Box(-10, 10, (20,)),
+        'action_space': gym.spaces.Box(-1, 1, (3,)),
+    })
+    options = dict(latent_size=4, residual_width=16, residual_layers=2, history_steps=4,
+                   backward_learning_rate=1e-5, discriminator_learning_rate=1e-5,
+                   discriminator_penalty=10., replay_blocks=2, replay_capacity=48, z_buffer_size=32,
+                   expert_sequence_length=2, exploration_std=.05, target_noise_clip=.3,
+                   orthogonal_coefficient=100., relabel_probability=.8,
+                   target_tau=.01, critic_target_tau=.005, auxiliary_coefficient=.02,
+                   style_coefficient=.05, task_reward_temperature=.05, cpu_threads=2)
+    agent = FBcprAgent('test', {
+        'config': {'fb': options, 'device': 'cpu', 'num_actors': 3, 'vec_env': vector,
+                   'seq_length': 4, 'horizon_length': 4, 'minibatch_size': 8,
+                   'learning_rate': 3e-4, 'gamma': .98, 'grad_norm': 1e30,
+                   'train_dir': str(tmp_path), 'name': 'test'},
+        'network': {},
+    })
+    agent.experts = ExpertSequences(torch.randn(30, 3, 20), torch.ones(30, 3, dtype=torch.bool))
+    return agent
+
+
+def test_production_cpr_update_and_checkpoint_restore(tmp_path):
+    torch.manual_seed(12)
+    agent = make_agent(tmp_path)
+    agent.replay.add({
+        'observation': torch.randn(4, 3, 16), 'next_observation': torch.randn(4, 3, 16),
+        'state': torch.randn(4, 3, 20), 'next_state': torch.randn(4, 3, 20),
+        'history': torch.randn(4, 3, 64), 'next_history': torch.randn(4, 3, 64),
+        'previous_action': torch.randn(4, 3, 3), 'action': torch.randn(4, 3, 3).tanh(),
+        'command': torch.randn(4, 3, 4), 'reward': torch.randn(4, 3, 1), 'auxiliary_reward': -torch.rand(4, 3, 1),
+        'discount': torch.ones(4, 3, 1) * .98, 'valid': torch.ones(4, 3, 1, dtype=torch.bool),
+    })
+    before = {name: value.clone() for name, value in agent.model.named_parameters()}
+    metrics = agent.update()
+    assert all(torch.isfinite(value) for value in metrics.values())
+    for prefix in ('forward_maps', 'backward', 'actor', 'style_maps', 'auxiliary_maps', 'discriminator'):
+        assert any(not torch.equal(value, before[name]) for name, value in agent.model.named_parameters() if name.startswith(prefix))
+    assert all(parameter.grad is None for parameter in agent.target.parameters())
+    assert agent.z_size == 8
+    assert agent.optimizer_step == 1
+    assert agent._sample_commands(20).shape == (20, 4)
+    assert metrics['replay/valid_fraction'] == 1
+    agent.run_started = __import__('time').monotonic()
+    path = tmp_path / 'checkpoint.pt'
+    agent.save(path)
+    restored = make_agent(tmp_path / 'restored')
+    restored.restore(path)
+    assert restored.optimizer_step == 1
+    torch.testing.assert_close(restored.task_command, agent.task_command)
+    torch.testing.assert_close(restored.reward_normalizer.square, agent.reward_normalizer.square)
+    for name, value in restored.model.state_dict().items():
+        torch.testing.assert_close(value, agent.model.state_dict()[name])

@@ -151,6 +151,8 @@ env:
 
   # related to Asymmetric Observation
   stateList: ["joint_pos", "joint_vel", "prev_action_targets", "palm_pos", "palm_rot", "palm_vel", "object_rot", "object_vel", "fingertip_pos_rel_palm", "keypoints_rel_palm", "keypoints_rel_goal", "object_scales", "closest_keypoint_max_dist", "closest_fingertip_dist", "lifted_object", "progress", "successes", "reward"]
+  clearActionQueueOnReset: False
+  referenceResetProbability: 0.0
   obsList: ["joint_pos", "joint_vel", "prev_action_targets", "palm_pos", "palm_rot", "object_rot", "fingertip_pos_rel_palm", "keypoints_rel_palm", "keypoints_rel_goal", "object_scales"]
   fixedSizeKeypointReward: True
   fixedSize: [0.141, 0.03025, 0.0271]

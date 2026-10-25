@@ -3710,6 +3710,26 @@ class SimToolReal(VecTask):
 
                 self.initial_state_idx += len(env_ids)
 
+        # Optional reference-state initialization uses states collected in this
+        # same scene, retaining each environment's object/actor indexing.
+        bank = getattr(self, "reference_reset_bank", None)
+        if bank is not None and episode_reset and tensor_reset and not self.cfg.get("test", False):
+            probability = self.cfg["env"].get("referenceResetProbability", 0.0)
+            selected = env_ids[torch.rand(len(env_ids), device=self.device) < probability]
+            weights = bank["valid"][:, selected].T.float()
+            available = weights.sum(-1) > 0
+            selected = selected[available]
+            if len(selected):
+                snapshots = torch.multinomial(weights[available], 1).squeeze(-1)
+                self.arm_hand_dof_pos[selected] = bank["joint_position"][snapshots, selected]
+                self.arm_hand_dof_vel[selected] = bank["joint_velocity"][snapshots, selected]
+                self.prev_targets[selected] = bank["target"][snapshots, selected]
+                self.cur_targets[selected] = self.prev_targets[selected]
+                self.root_state_tensor[self.object_indices[selected]] = bank["object"][snapshots, selected]
+                self.root_state_tensor[self.table_indices[selected]] = bank["table"][snapshots, selected]
+                self.lifted_object[selected] = bank["lifted"][snapshots, selected]
+                self.deferred_set_actor_root_state_tensor_indexed([self.object_indices[selected], self.table_indices[selected]])
+
         self.gym.set_dof_position_target_tensor_indexed(
             self.sim,
             gymtorch.unwrap_tensor(self.prev_targets),
@@ -3763,6 +3783,11 @@ class SimToolReal(VecTask):
             self.last_time = time.time()
 
         actions = actions.to(self.device)
+
+        # Episode resets clear delayed controls before selecting a queued action.
+        # This preserves the normal delay distribution inside physical episodes.
+        if self.cfg["env"].get("clearActionQueueOnReset", False):
+            self.action_queue[self.reset_buf.bool()] = 0
 
         # Update actions queue
         self.action_queue = self.update_queue(

@@ -299,3 +299,33 @@ This implementation builds on the following codebases:
 # Contact
 
 If you have any questions, issues, or feedback, please contact [Tyler Lum](https://tylerlum.github.io/) or [Kushal Kedia](https://kushal2000.github.io/).
+
+
+### FB-CPR v2 experiment
+
+The `fb-v2` worktree adds BFM-Zero residual actor/critics, four-frame sensor
+history, conditional imitation reward, expert prompts and reference-state resets.
+The public observation/action contract remains 140/29. Design and current results:
+[design](../doc/D-BFM/v2/simtoolreal_fb_v2.md),
+[results](../doc/D-BFM/v2/simtoolreal_fb_v2_results.md).
+
+Use the existing uv-managed Isaac Gym environment without copying dependencies:
+
+```bash
+export PYTHONPATH="$PWD:$PWD/rl_games"
+export LD_LIBRARY_PATH=/usr/lib64:${LD_LIBRARY_PATH:-}
+/home/MLTL-INTERN/shaoyang/zvi/dex_fb_ws/SimToolReal-fb/.venv/bin/python -m torch.distributed.run \
+  --nproc_per_node=4 -m isaacgymenvs.train task=SimToolRealLSTMAsymmetric \
+  train=SimToolRealFBV2 num_envs=6144 multi_gpu=True headless=True \
+  task.env.clearActionQueueOnReset=True task.env.referenceResetProbability=1.0 \
+  experiment=bfm_v2 train.params.config.train_dir=train_dir/dbfm-v2
+```
+
+Run GPU commands only within an allocated PBS job. Formal runs additionally set
+camera/graphics options and the fixed evaluation protocol described in the design.
+Teacher weights are the author's `pretrained_policy/config.yaml` and `model.pth`;
+`train.params.config.fb.teacher_path` selects their absolute location. Collection
+saves per-rank expert files under the normal run directory and validates contiguous
+expert sequences before learner updates. Evaluation does not load reference resets.
+BFM-Zero-derived network/loss components carry the upstream CC BY-NC 4.0 notice in
+[docs/licenses/bfm-zero-LICENSE](docs/licenses/bfm-zero-LICENSE).
