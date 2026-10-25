@@ -1,0 +1,25 @@
+defaults:
+  - SimToolRealFBV3
+  - _self_
+
+params:
+  config:
+    name: ${resolve_default:SimToolRealFBV4,${....experiment}}
+    horizon_length: 1
+    seq_length: 1
+    max_epochs: 1000000
+    fb:
+      # Lifted is field 158, not the first excluded field (152).
+      backward_state_size: 153
+      backward_state_indices: ${eval:"list(range(152)) + [158]"}
+      local_prompt: true
+      logo_coefficient: 0.005
+      logo_local_weight: 0.5714285714285714
+      logo_goal_weight: 0.4285714285714286
+      logo_horizon: 8
+      temporal_replay: true
+      replay_capacity: 20480000
+      warmup_blocks: 64
+      updates_per_iteration: 16
+      # First tranche for measured quality/debug review, then resume if useful.
+      max_seconds: 12600

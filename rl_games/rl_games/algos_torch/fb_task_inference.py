@@ -143,7 +143,8 @@ def main():
     options = checkpoint['options']
     normalizer = BatchNormalizer(checkpoint['schema']['state']).to(args.device)
     normalizer.load_state_dict(checkpoint['state_normalizer'])
-    backward = BackwardMap(options['backward_state_size'], options['latent_size']).to(args.device)
+    backward = BackwardMap(options['backward_state_size'], options['latent_size'],
+                           options.get('backward_state_indices')).to(args.device)
     backward.load_state_dict({key[len('backward.'):]: value for key, value in checkpoint['model'].items()
                              if key.startswith('backward.')})
     frame, step = checkpoint['frame'], checkpoint['optimizer_step']

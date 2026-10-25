@@ -488,7 +488,7 @@ class FBAgent:
         if self.last_checkpoint is not None:
             shard = self.last_checkpoint.with_name(self.last_checkpoint.stem + ".rank" + str(self.global_rank) + ".replay.pt")
             if shard.exists():
-                saved = torch.load(shard, map_location=self.device)
+                saved = torch.load(shard, map_location=self.replay.device)
                 self.replay.load_state_dict(saved["replay"])
                 # Retain off-policy experience, but start fresh episodes. Old
                 # physical tensors are not a GPU PhysX solver snapshot; copying

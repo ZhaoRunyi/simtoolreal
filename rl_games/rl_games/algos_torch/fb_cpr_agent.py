@@ -22,7 +22,7 @@ import yaml
 from rl_games.algos_torch.fb_agent import FBAgent
 from rl_games.algos_torch.fb_networks import project_task, successor_loss
 from rl_games.algos_torch.fb_cpr_networks import (
-    BatchNormalizer, CPRModel, ExpertSequences, RewardNormalizer, TransitionReplay,
+    BatchNormalizer, CPRModel, ExpertSequences, RewardNormalizer, TransitionReplay, TemporalReplay,
 )
 from rl_games.algos_torch.fb_task_inference import (
     reward_components, infer_command_bank, checkpoint_digest,
@@ -49,7 +49,8 @@ class FBcprAgent(FBAgent):
         self.discriminator_optimizer = torch.optim.Adam(
             self.model.discriminator.parameters(), lr=self.options['discriminator_learning_rate']
         )
-        self.replay = TransitionReplay(
+        replay_class = TemporalReplay if self.options.get('temporal_replay', False) else TransitionReplay
+        self.replay = replay_class(
             math.ceil(self.options['replay_capacity'] / self.world_size), self.num_actors,
             self.config['horizon_length'], self.device,
         )
@@ -85,7 +86,7 @@ class FBcprAgent(FBAgent):
         order = ((counts * requested) % total).argsort(descending=True)
         allocation[order[:remainder]] += 1
         count = int(allocation[self.global_rank])
-        generator = torch.Generator(device=self.device)
+        generator = torch.Generator(device=self.replay.device)
         generator.manual_seed(self.options['inference_seed'] + self.global_rank)
         batch = self.replay.sample(count, generator=generator)
         if 'reward_components' not in batch:
@@ -277,6 +278,21 @@ class FBcprAgent(FBAgent):
         normalized = self.observation_normalizer(history.reshape(-1, self.observation_size)).reshape(history.shape[0], -1)
         return torch.cat((normalized, self.action_normalizer(previous_action)), dim=-1)
 
+    def _sample_action(self, history, state, command, clip=None):
+        prompt = self.model.actor_prompt(state, command)
+        return self.model.actor.sample(history, prompt, self.options['exploration_std'], clip)
+
+    def _actor_objective(self, state, history, command):
+        action = self._sample_action(history, state, command, self.options['target_noise_clip'])
+        critic_state = torch.cat((state, history), -1)
+        q_fb = (self.model(critic_state, action, command) * command).sum(-1).min(0).values
+        q_style = self.model.style(critic_state, action, command).min(0).values
+        q_auxiliary = self.model.auxiliary(critic_state, action, command).min(0).values
+        scale = q_fb.detach().abs().mean()
+        loss = -q_fb.mean() - scale * (self.options['style_coefficient'] * q_style.mean()
+                                     + self.options['auxiliary_coefficient'] * q_auxiliary.mean())
+        return loss, q_fb, q_style, q_auxiliary
+
     @torch.no_grad()
     def _rollout_prompts(self):
         refresh = self.reset_before | (self.command_age >= self.options['command_steps'])
@@ -309,8 +325,8 @@ class FBcprAgent(FBAgent):
             self.history = torch.cat((self.history[:, 1:], self.observations['obs'][:, None]), dim=1)
             history = self.history.clone()
             previous_action = self.previous_action.clone()
-            action = self.model.actor.sample(self._history_input(history, previous_action), self.rollout_command,
-                                             self.options['exploration_std'])
+            action = self._sample_action(self._history_input(history, previous_action),
+                                         self.state_normalizer(self.observations['states']), self.rollout_command)
             current = {key: value.clone() for key, value in self.observations.items()}
             observations, reward, done, info = self.vec_env.step(action)
             observations = {key: value.clone() for key, value in observations.items()}
@@ -371,6 +387,9 @@ class FBcprAgent(FBAgent):
             'task/lifted_fraction': environment.lifted_object.float().mean(),
             'replay/capacity_transitions_global': reward.new_tensor(self.replay.capacity * self.num_actors * self.config['horizon_length'] * self.world_size),
             'command/z_buffer_size': reward.new_tensor(self.z_size),
+            'learning/sample_reuse': reward.new_tensor(self.options['updates_per_iteration'] * self.config['minibatch_size']
+                                                       / (self.num_actors * self.config['horizon_length'])),
+            'replay/steps_per_environment': reward.new_tensor(self.replay.capacity * self.config['horizon_length']),
         })
         return metrics
 
@@ -425,7 +444,7 @@ class FBcprAgent(FBAgent):
             self._cache_commands(command, sources)
             relabel = torch.rand(count, 1, device=self.device) < self.options['relabel_probability']
             command = torch.where(relabel, command, batch['command'])
-            next_action = self.model.actor.sample(next_history, command, self.options['exploration_std'], self.options['target_noise_clip'])
+            next_action = self._sample_action(next_history, next_state, command, self.options['target_noise_clip'])
             target_forward = self.target(next_critic_state, next_action, command)
             target_backward = self.target.backward(next_state)
         forward = self.model(critic_state, batch['action'], command)
@@ -449,7 +468,7 @@ class FBcprAgent(FBAgent):
             ('auxiliary', auxiliary_reward, self.auxiliary_optimizer),
         ):
             with torch.no_grad():
-                next_control = self.model.actor.sample(next_history, command, self.options['exploration_std'], self.options['target_noise_clip'])
+                next_control = self._sample_action(next_history, next_state, command, self.options['target_noise_clip'])
                 target_value = getattr(self.target, name)(next_critic_state, next_control, command).min(0).values
                 target_value = reward + discount.squeeze(-1) * target_value
             values = getattr(self.model, name)(critic_state, batch['action'], command)
@@ -462,12 +481,26 @@ class FBcprAgent(FBAgent):
         critics = list(self.model.forward_maps.parameters()) + list(self.model.style_maps.parameters()) + list(self.model.auxiliary_maps.parameters())
         for parameter in critics:
             parameter.requires_grad_(False)
-        action = self.model.actor.sample(history, command, self.options['exploration_std'], self.options['target_noise_clip'])
-        q_fb = (self.model(critic_state, action, command) * command).sum(-1).min(0).values
-        q_style = self.model.style(critic_state, action, command).min(0).values
-        q_auxiliary = self.model.auxiliary(critic_state, action, command).min(0).values
-        scale = q_fb.detach().abs().mean()
-        actor_loss = -q_fb.mean() - scale * (self.options['style_coefficient'] * q_style.mean() + self.options['auxiliary_coefficient'] * q_auxiliary.mean())
+        actor_loss, q_fb, q_style, q_auxiliary = self._actor_objective(state, history, command)
+        if self.options.get('logo_coefficient', 0) > 0:
+            window = self.replay.sample_window(count, self.options['logo_horizon'])
+            available = torch.tensor(int(window is not None), device=self.device)
+            if self.world_size > 1:
+                distributed.all_reduce(available, op=distributed.ReduceOp.MIN)
+            metrics['logo/available'] = available.float()
+            if available.item():
+                local_state = self.state_normalizer(window['state'])
+                local_history = self._history_input(window['history'].reshape(
+                    -1, self.options['history_steps'], self.observation_size), window['previous_action'])
+                with torch.no_grad():
+                    local_command = self.model.backward(self.state_normalizer(window['local_state']))
+                    goal_command = self.model.backward(self.state_normalizer(window['goal_state']))
+                local_loss = self._actor_objective(local_state, local_history, local_command)[0]
+                goal_loss = self._actor_objective(local_state, local_history, goal_command)[0]
+                pair_loss = self.options['logo_local_weight'] * local_loss + self.options['logo_goal_weight'] * goal_loss
+                actor_loss = actor_loss + self.options['logo_coefficient'] * pair_loss
+                metrics.update({'loss/logo_local': local_loss.detach(), 'loss/logo_goal': goal_loss.detach(),
+                                'loss/logo_scaled': self.options['logo_coefficient'] * pair_loss.detach()})
         actor_grad = self._synchronize_step(actor_loss, self.actor_optimizer, self.model.actor.parameters())
         for parameter in critics:
             parameter.requires_grad_(True)
@@ -485,8 +518,13 @@ class FBcprAgent(FBAgent):
                 self.task_command = project_task(task_vector)
             moment = backward.detach().T @ backward.detach() / count
             eigenvalues = torch.linalg.eigvalsh(moment)
-            mean_action = self.model.actor(history, command)
-            other_action = self.model.actor(history, command.roll(1, 0))
+            prompt = self.model.actor_prompt(state, command)
+            mean_action = self.model.actor(history, prompt)
+            other_action = self.model.actor(history, self.model.actor_prompt(state, command.roll(1, 0)))
+            metrics['policy/prompt_norm'] = prompt.norm(dim=-1).mean()
+            metrics['policy/arm_saturation'] = (mean_action[:, :7].abs() > .95).float().mean()
+            metrics['policy/hand_saturation'] = ((mean_action[:, 7:].abs() > .95).float().mean()
+                                                 if self.action_size > 7 else mean_action.new_zeros(()))
         self.optimizer_step += 1
         metrics.update({
             'loss/fb': fb_loss.detach(), 'loss/orthogonal': .5 * orthogonal.detach(),
@@ -568,7 +606,8 @@ class FBcprPlayer(FBcprAgent):
             self.previous_action[self.history_reset] = 0
             self.history = torch.cat((self.history[:, 1:], self.observations['obs'][:, None]), dim=1)
             command = self._evaluation_commands(environment)
-            action = self.model.actor(self._history_input(self.history, self.previous_action), command)
+            prompt = self.model.actor_prompt(self.state_normalizer(self.observations['states']), command)
+            action = self.model.actor(self._history_input(self.history, self.previous_action), prompt)
             observations, reward, done, info = self.vec_env.step(action)
             returns += reward.reshape(-1)
             for index in done.nonzero().flatten().tolist():
