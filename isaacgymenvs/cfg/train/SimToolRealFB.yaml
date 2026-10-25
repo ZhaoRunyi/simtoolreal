@@ -1,0 +1,46 @@
+defaults:
+  - SimToolRealLSTMAsymmetricPPO
+  - _self_
+
+params:
+  algo:
+    name: fb
+  config:
+    name: ${resolve_default:SimToolRealFB,${....experiment}}
+    train_dir: runs
+    # Four ranks give the original launcher's 24576 environments. Each formal
+    # iteration consumes 16 steps; four updates consume 98304 global examples.
+    minibatch_size: 6144
+    seq_length: 16
+    horizon_length: 16
+    max_epochs: 25000
+    learning_rate: 0.0001
+    save_frequency: 100
+    fb:
+      latent_size: 128
+      critic_units: [1024, 1024, 512, 512]
+      backward_units: [512, 512]
+      backward_learning_rate: 0.00001
+      orthogonal_coefficient: 100.0
+      auxiliary_coefficient: 1.0
+      reward_scale: 0.01
+      target_tau: 0.01
+      exploration_std: 0.2
+      target_noise_clip: 0.3
+      command_steps: 100
+      goal_mix_probability: 0.5
+      task_mix_probability: 0.2
+      task_reward_temperature: 0.05
+      relabel_probability: 0.8
+      replay_blocks: 16
+      warmup_blocks: 4
+      updates_per_iteration: 4
+      target_frames: 2000000000
+      max_seconds: 27000
+      speed_gate_seconds: 900
+      stop_on_slow: true
+      log_interval: 10
+      evaluation_steps: 1200
+      allow_fresh_replay: false
+      cpu_threads: 2
+      tf32: true

@@ -146,6 +146,80 @@ Sim2Real deployment runs four nodes: an RL policy node and a goal pose node (thi
 
 # Formatting
 
+## Forward-backward agent (`fb` branch)
+
+`train=SimToolRealFB` registers a recurrent off-policy FB learner in the existing
+rl_games runner. The original task, 140-dimensional policy observation,
+asymmetric state, 29-dimensional action, domain randomization, goal resampling,
+reward and tolerance curriculum are retained. The actor's LSTM sees policy
+observations only; the task command is concatenated after memory. Backward maps
+also see only policy observations. Forward and auxiliary critics see the
+existing asymmetric state. No expert dataset or discriminator is assumed.
+
+Local Python 3.8 / Isaac Gym setup (run in this checkout):
+
+```bash
+source /home/MLTL-INTERN/shaoyang/zvi/.uv/env.sh
+uv venv --python /usr/bin/python3.8 .venv
+uv pip install --python .venv/bin/python --index-strategy unsafe-best-match -r requirements-fb.txt
+PYTORCH3D_NO_EXTENSION=1 uv pip install --python .venv/bin/python --no-build-isolation --no-deps \
+  -e ../third_party/isaacgym/python -e ../third_party/pytorch3d -e ./rl_games -e .
+source .venv/bin/activate
+export LD_LIBRARY_PATH="/usr/lib64:${LD_LIBRARY_PATH:-}"
+export OMP_NUM_THREADS=2
+python -m pytest isaacgymenvs/tests/test_fb_agent.py -q
+```
+
+This training profile uses PyTorch3D transforms, not its renderer/CUDA operators.
+The full ROS/perception/Isaac Sim dependency set is outside this profile.
+Run GPU commands only inside a PBS allocation. A four-GPU run gives 24,576
+global environments and 98,304 learner examples per rollout iteration:
+
+```bash
+python -m torch.distributed.run --standalone --nproc_per_node=4 \
+  -m isaacgymenvs.train task=SimToolRealLSTMAsymmetric train=SimToolRealFB \
+  num_envs=6144 multi_gpu=True headless=True force_render=False graphics_device_id=-1 \
+  task.env.enableCameraSensors=False task.env.capture_video=False \
+  'task.env.objectScaleNoiseMultiplierRange=[0.9,1.1]' \
+  task.env.forceConsecutiveNearGoalSteps=True \
+  experiment=fb_aux train.params.config.train_dir=/tmp/simtoolreal-fb \
+  wandb_activate=True wandb_project=simtoolreal_fb wandb_entity=YOUR_ENTITY
+```
+
+Use `train.params.config.fb.auxiliary_coefficient=0` for the pure-FB control.
+Architecture and optimizer settings remain identical. Both runs include random
+tasks, replay-goal tasks and task-reward inference, and preserve original
+rollout commands before learner relabeling. Training metrics go to JSONL,
+TensorBoard and W&B; `status.json` reports lifecycle and projected runtime.
+The speed gate saves a resumable checkpoint and stops if the configured sample
+budget cannot fit the time budget after warm-up. A `stop.request` file in the
+experiment directory also requests a coordinated checkpoint and stop.
+
+Resume requires `last.pt` and the matching `last.rankN.replay.pt` shards;
+pass `checkpoint=/absolute/path/last.pt`. The replay shards include recorded
+sequences, recurrent context, environment state and RNG states. They do not
+claim bitwise restoration of PhysX's internal solver state.
+
+Evaluate with the same architecture/config, a new seed and the learned reward
+command. Evaluation does not initialize W&B:
+
+```bash
+python -m isaacgymenvs.train task=SimToolRealLSTMAsymmetric train=SimToolRealFB \
+  test=True checkpoint=/absolute/path/last.pt seed=9000 num_envs=384 \
+  headless=True force_render=False graphics_device_id=-1 \
+  task.env.enableCameraSensors=False task.env.capture_video=False \
+  task.env.forceConsecutiveNearGoalSteps=True task.env.evalSuccessTolerance=0.01 \
+  experiment=fb_eval train.params.config.train_dir=/tmp/simtoolreal-fb-eval
+```
+
+The native FB player writes episode-level `evaluation.json`. To evaluate a
+specific DexToolBench object or fixed target sequence, use the original task's
+`objectName`, `useFixedGoalStates`, `fixedGoalStatesJsonPath` and table settings;
+these remain environment configuration, not a separate task implementation.
+
+The design/implementation audit lives in the workspace's
+`doc/D-BFM/designs/simtoolreal_fb_v1.md`.
+
 Python files:
 
 ```

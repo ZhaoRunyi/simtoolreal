@@ -103,8 +103,8 @@ def get_rlgames_env_creator(
 
             print(f"global_rank = {global_rank} local_rank = {local_rank} world_size = {world_size}")
 
-            _sim_device = f'cuda:0'
-            _rl_device = f'cuda:0'
+            _sim_device = f'cuda:{local_rank}'
+            _rl_device = f'cuda:{local_rank}'
 
             task_config['rank'] = local_rank
             task_config['rl_device'] = _rl_device

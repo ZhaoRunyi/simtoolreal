@@ -30,7 +30,7 @@ class RnnWithDones(nn.Module):
         batch_size = input.size()[1]
         out_batch = []
         not_dones = 1.0-done_masks
-        has_zeros = ((not_dones.squeeze()[1:] == 0.0)
+        has_zeros = ((not_dones.reshape(max_steps, batch_size)[1:] == 0.0)
                      .any(dim=-1)
                      .nonzero()
                      .squeeze()
