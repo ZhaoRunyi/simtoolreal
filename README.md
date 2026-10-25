@@ -208,6 +208,7 @@ python -m isaacgymenvs.train task=SimToolRealLSTMAsymmetric train=SimToolRealFB 
   test=True checkpoint=/absolute/path/last.pt seed=9000 num_envs=384 \
   headless=True force_render=False graphics_device_id=-1 \
   task.env.enableCameraSensors=False task.env.capture_video=False \
+  'task.env.objectScaleNoiseMultiplierRange=[0.9,1.1]' \
   task.env.forceConsecutiveNearGoalSteps=True task.env.evalSuccessTolerance=0.01 \
   experiment=fb_eval train.params.config.train_dir=/tmp/simtoolreal-fb-eval
 ```
@@ -217,8 +218,30 @@ specific DexToolBench object or fixed target sequence, use the original task's
 `objectName`, `useFixedGoalStates`, `fixedGoalStatesJsonPath` and table settings;
 these remain environment configuration, not a separate task implementation.
 
+For the 600-step noisy tool-sequence protocol, add these overrides to the
+evaluation command above (and use `num_envs=10`):
+
+```bash
+train.params.config.fb.evaluation_steps=600 \
+task.env.objectName=claw_hammer task.env.startArmHigher=True \
+task.env.useFixedGoalStates=True \
+task.env.fixedGoalStatesJsonPath=/home/MLTL-INTERN/shaoyang/zvi/dex_fb_ws/SimToolReal-fb/dextoolbench/trajectories/hammer/claw_hammer/swing_down.json \
+task.env.asset.table=urdf/dextoolbench/environments/hammer/claw_hammer/swing_down.urdf
+```
+
+This retains training-style noise and the 600-step horizon. The official
+`dextoolbench/eval_isaacgym.py` protocol changes additional settings; report
+the two protocols separately.
+
 The design/implementation audit lives in the workspace's
 `doc/D-BFM/designs/simtoolreal_fb_v1.md`.
+
+The first formal matrix completed 2,000,289,792 transitions per variant on
+2026-10-25, with recorded training times of 2.492 hours (pure) and 2.757 hours
+(aux). All 50 evaluation cases were valid, covering 2,334 completed episodes;
+neither variant completed a goal under the noisy stress protocol. Detailed
+results, checkpoint audits and data-coverage measurements are in the workspace's
+`doc/D-BFM/designs/simtoolreal_fb_v1_results.md`.
 
 # Formatting
 
