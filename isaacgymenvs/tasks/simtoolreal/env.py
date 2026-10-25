@@ -3795,7 +3795,10 @@ class SimToolReal(VecTask):
         # Episode resets clear delayed controls before selecting a queued action.
         # This preserves the normal delay distribution inside physical episodes.
         if self.cfg["env"].get("clearActionQueueOnReset", False):
-            self.action_queue[self.reset_buf.bool()] = 0
+            resetting = self.reset_buf.bool()
+            self.action_queue[resetting] = 0
+            actions = actions.clone()
+            actions[resetting] = 0
 
         # Update actions queue
         self.action_queue = self.update_queue(
