@@ -113,10 +113,12 @@ class FBAgent:
         if self.global_rank != 0:
             return
         report = {
+            **metrics,
             "state": state, "epoch": self.epoch_num,
             "optimizer_step": self.optimizer_step, "environment_steps": self.frame,
             "checkpoint": str(self.last_checkpoint) if self.last_checkpoint else None,
-            "updated_at": time.time(), **metrics,
+            "updated_at": time.time(),
+            "metrics_optimizer_step": metrics.get("optimizer_step"),
         }
         path = self.output_dir / "status.json"
         temporary = path.with_suffix(".tmp")
@@ -235,6 +237,7 @@ class FBAgent:
         return {
             "rollout/reward": block["reward"].mean(),
             "rollout/completed_episodes": torch.tensor(valid_returns.numel(), device=self.device),
+            "rollout/episode_return_sum": valid_returns.sum(),
             "rollout/episode_return": valid_returns.mean() if valid_returns.numel() else torch.tensor(0., device=self.device),
             "task/successes_per_completed_episode": environment.prev_episode_successes.float().mean(),
             "task/closest_keypoint_distance": environment.prev_episode_closest_keypoint_max_dist.float().mean(),
@@ -369,8 +372,12 @@ class FBAgent:
         values = torch.stack([torch.as_tensor(metrics[name], device=self.device).float() for name in names])
         if self.world_size > 1:
             distributed.all_reduce(values)
-            values.div_(self.world_size)
+            for index, name in enumerate(names):
+                if name not in ("rollout/completed_episodes", "rollout/episode_return_sum"):
+                    values[index].div_(self.world_size)
         result = {name: float(value) for name, value in zip(names, values.cpu())}
+        if result.get("rollout/completed_episodes", 0) > 0:
+            result["rollout/episode_return"] = result["rollout/episode_return_sum"] / result["rollout/completed_episodes"]
         if not all(np.isfinite(value) for value in result.values()):
             raise FloatingPointError("Nonfinite diagnostic metric")
         if self.global_rank == 0:
@@ -484,7 +491,7 @@ class FBAgent:
                 decision = torch.zeros((), device=self.device, dtype=torch.long)
                 if self.global_rank == 0:
                     stop_requested = (self.output_dir / "stop.request").exists()
-                    slow = elapsed >= self.options["speed_gate_seconds"] and remaining + elapsed > self.options["max_seconds"]
+                    slow = elapsed >= self.options["speed_gate_seconds"] and remaining + elapsed + self.elapsed_before_resume > self.options["max_seconds"]
                     complete = self.frame >= self.options["target_frames"]
                     expired = elapsed + self.elapsed_before_resume >= self.options["max_seconds"]
                     if complete:

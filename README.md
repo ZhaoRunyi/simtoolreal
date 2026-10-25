@@ -144,9 +144,7 @@ DexToolBench covers 6 tool categories (hammer, marker, eraser, brush, spatula, s
 
 Sim2Real deployment runs four nodes: an RL policy node and a goal pose node (this repo), a perception node (SAM + FoundationPose, in the [FoundationPose fork](https://github.com/kushal2000/FoundationPose)), and a robot node. For safe testing, the Sim2Sim setup replaces the robot and perception nodes with a simulation node. See the [Deployment](docs/deployment.md) documentation for node diagrams and step-by-step run instructions.
 
-# Formatting
-
-## Forward-backward agent (`fb` branch)
+# Forward-backward agent (`fb` branch)
 
 `train=SimToolRealFB` registers a recurrent off-policy FB learner in the existing
 rl_games runner. The original task, 140-dimensional policy observation,
@@ -219,6 +217,8 @@ these remain environment configuration, not a separate task implementation.
 
 The design/implementation audit lives in the workspace's
 `doc/D-BFM/designs/simtoolreal_fb_v1.md`.
+
+# Formatting
 
 Python files:
 
