@@ -452,9 +452,12 @@ class FBAgent:
             if shard.exists():
                 saved = torch.load(shard, map_location=self.device)
                 self.replay.load_state_dict(saved["replay"])
-                self.vec_env.set_env_state(saved["environment"])
-                for name in ("observations", "actor_state", "rollout_command", "command_age", "reset_before", "episode_reward", "previous_block", "previous_initial_state"):
-                    setattr(self, name, saved[name])
+                # Retain off-policy experience, but start fresh episodes. Old
+                # physical tensors are not a GPU PhysX solver snapshot; copying
+                # them into a new scene crashed its broadphase in the GPU check.
+                for name in ("success_tolerance", "frame_since_restart", "last_curriculum_update"):
+                    if name in saved["environment"]:
+                        setattr(self.vec_env.env, name, saved["environment"][name])
                 torch.set_rng_state(saved["rng"].cpu())
                 torch.cuda.set_rng_state(saved["cuda_rng"].cpu(), self.device)
                 np.random.set_state(saved["numpy_rng"])

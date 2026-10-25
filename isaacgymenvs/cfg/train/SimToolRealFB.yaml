@@ -8,6 +8,7 @@ params:
   config:
     name: ${resolve_default:SimToolRealFB,${....experiment}}
     train_dir: runs
+    mixed_precision: False  # FB uses FP32/TF32 rather than PPO AMP.
     # Four ranks give the original launcher's 24576 environments. Each formal
     # iteration consumes 16 steps; four updates consume 98304 global examples.
     minibatch_size: 6144

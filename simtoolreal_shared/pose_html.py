@@ -58,6 +58,8 @@ def portable_visual_urdf(
 
         if mesh_path not in encoded_by_path:
             mime = mimetypes.guess_type(mesh_path.name)[0] or "application/octet-stream"
+            if mesh_path.suffix.lower() == ".stl":
+                mime = "model/stl"
             payload = base64.b64encode(mesh_path.read_bytes()).decode("ascii")
             encoded_by_path[mesh_path] = (
                 f"data:{mime};base64,{payload}#ext={mesh_path.suffix.lower()}"

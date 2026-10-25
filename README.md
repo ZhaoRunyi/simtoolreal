@@ -195,8 +195,10 @@ experiment directory also requests a coordinated checkpoint and stop.
 
 Resume requires `last.pt` and the matching `last.rankN.replay.pt` shards;
 pass `checkpoint=/absolute/path/last.pt`. The replay shards include recorded
-sequences, recurrent context, environment state and RNG states. They do not
-claim bitwise restoration of PhysX's internal solver state.
+sequences, recurrent context, environment audit state and RNG states. Recovery
+restores learner/replay and scalar curriculum, then starts new episodes through
+the original reset path. It does not write old physical tensors into a new
+PhysX scene or claim bitwise restoration of the solver state.
 
 Evaluate with the same architecture/config, a new seed and the learned reward
 command. Evaluation does not initialize W&B:
