@@ -101,7 +101,7 @@ def test_production_learner_updates_all_enabled_networks(tmp_path, auxiliary_coe
     agent = FBAgent("test", {
         "config": {"fb": options, "device": "cpu", "num_actors": 3, "vec_env": vector,
                    "seq_length": 2, "horizon_length": 2, "minibatch_size": 6,
-                   "learning_rate": 1e-3, "train_dir": str(tmp_path), "name": "test"},
+                   "learning_rate": 1e-3, "gamma": .99, "train_dir": str(tmp_path), "name": "test"},
         "network": {"rnn": {"units": 8}, "mlp": {"units": [16, 8]}},
     })
     agent.replay.add({
@@ -122,3 +122,16 @@ def test_production_learner_updates_all_enabled_networks(tmp_path, auxiliary_coe
     assert any(changed for name, changed in changes.items() if name.startswith("backward."))
     assert any(changed for name, changed in changes.items() if name.startswith("auxiliary_maps.")) == bool(auxiliary_coefficient)
     assert all(parameter.grad is None for parameter in agent.target.parameters())
+
+
+def test_original_bounds_penalty_can_recover_saturated_action_logits():
+    from rl_games.algos_torch.a2c_continuous import A2CAgent
+    from types import SimpleNamespace
+
+    logits = torch.tensor([[-20., 0., 20.]], requires_grad=True)
+    baseline = A2CAgent.bound_loss(SimpleNamespace(bounds_loss_coef=.0001), logits)
+    penalty = (logits.abs() - 1.1).clamp_min(0).square().sum(-1)
+    torch.testing.assert_close(penalty, baseline)
+    gradient = torch.autograd.grad(penalty.sum(), logits)[0]
+    assert gradient[0, 0] < 0 and gradient[0, 2] > 0
+    assert gradient[0, 1] == 0

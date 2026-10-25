@@ -262,6 +262,9 @@ class FBAgent:
         batch = self.replay.sample(sequence_count)
         burn_in = self.config["horizon_length"]
         suffix = {key: value[burn_in:].flatten(0, 1) for key, value in batch.items() if key not in ("hidden", "cell")}
+        # Decode terminal membership, retaining the exact configured discount
+        # even when restoring older half-precision replay shards.
+        suffix["discount"] = (suffix["discount"] > 0).float() * self.config["gamma"]
         observation = self.observation_normalizer(suffix["observation"])
         next_observation = self.observation_normalizer(suffix["next_observation"])
         state = self.state_normalizer(suffix["state"])
@@ -320,14 +323,21 @@ class FBAgent:
         for parameter in critics:
             parameter.requires_grad_(False)
         memory, _ = self._training_memory(batch, True)
-        proposed_action = self.model.actor.act(memory, command)
+        action_logits = self.model.actor.action_logits(memory, command)
+        proposed_action = action_logits.tanh()
         q_values = (self.model(state, proposed_action, command) * command).sum(-1).min(0).values
         auxiliary_values = self.model.auxiliary(state, proposed_action, command).min(0).values
         q_scale = (q_values.detach().abs() * valid).sum() / valid.sum().clamp_min(1)
         auxiliary_scale = (auxiliary_values.detach().abs() * valid).sum() / valid.sum().clamp_min(1)
         objective = q_values / q_scale.clamp_min(1)
         objective = objective + self.options["auxiliary_coefficient"] * auxiliary_values / auxiliary_scale.clamp_min(1)
+        bounds_penalty = (action_logits.abs() - 1.1).clamp_min(0).square().sum(-1)
+        bounds_loss = (bounds_penalty * valid).sum() / valid.sum().clamp_min(1)
         actor_loss = -(objective * valid).sum() / valid.sum().clamp_min(1)
+        actor_loss = actor_loss + self.config.get("bounds_loss_coef", 0.0001) * bounds_loss
+        with torch.no_grad():
+            other_action = self.model.actor.act(memory.detach(), command.roll(1, 0))
+            command_action_delta = (proposed_action.detach() - other_action).norm(dim=-1).mean()
         actor_grad = self._synchronize_step(actor_loss, self.actor_optimizer, self.model.actor.parameters())
         for parameter in critics:
             parameter.requires_grad_(True)
@@ -338,11 +348,10 @@ class FBAgent:
         with torch.no_grad():
             moment = backward.detach().T @ (backward.detach() * valid[:, None]) / valid.sum().clamp_min(1)
             eigenvalues = torch.linalg.eigvalsh(moment)
-            other_task = command.roll(1, 0)
-            other_action = self.model.actor.act(memory.detach(), other_task)
         return {
             "loss/fb": fb_loss.detach(), "loss/orthogonal": orthogonal_loss.detach(),
             "loss/auxiliary": auxiliary_loss.detach(), "loss/actor": actor_loss.detach(),
+            "loss/bounds": bounds_loss.detach(),
             "gradient/representation": representation_grad, "gradient/actor": actor_grad,
             "gradient/auxiliary": auxiliary_grad, "value/fb": q_values.detach().mean(),
             "value/auxiliary": auxiliary_values.detach().mean(),
@@ -352,7 +361,7 @@ class FBAgent:
             "representation/effective_rank": moment.trace().square() / moment.square().sum().clamp_min(1e-8),
             "replay/valid_fraction": valid.mean(), "task/relabel_fraction": relabel.float().mean(),
             "policy/action_saturation": (proposed_action.detach().abs() > .95).float().mean(),
-            "policy/command_action_delta": (proposed_action.detach() - other_action).norm(dim=-1).mean(),
+            "policy/command_action_delta": command_action_delta,
         }
 
     def _log(self, metrics):

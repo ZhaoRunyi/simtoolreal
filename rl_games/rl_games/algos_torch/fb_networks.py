@@ -88,7 +88,10 @@ class RecurrentTaskActor(NetworkBuilder.BaseNetwork):
         return self.normalizer(memory), states
 
     def act(self, memory, task):
-        return self.policy(torch.cat((memory, task), dim=-1)).tanh()
+        return self.action_logits(memory, task).tanh()
+
+    def action_logits(self, memory, task):
+        return self.policy(torch.cat((memory, task), dim=-1))
 
 
 class FBModel(nn.Module):
@@ -134,7 +137,9 @@ class SequenceReplay:
         if self.storage is None:
             self.storage = {}
             for key, value in block.items():
-                dtype = torch.float16 if value.is_floating_point() else value.dtype
+                dtype = value.dtype
+                if value.is_floating_point() and key not in ("reward", "discount"):
+                    dtype = torch.float16
                 self.storage[key] = torch.empty(
                     (self.capacity,) + value.shape, dtype=dtype, device=self.device
                 )
