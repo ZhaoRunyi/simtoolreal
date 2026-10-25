@@ -90,3 +90,34 @@ def test_production_cpr_update_and_checkpoint_restore(tmp_path):
     torch.testing.assert_close(restored.reward_normalizer.square, agent.reward_normalizer.square)
     for name, value in restored.model.state_dict().items():
         torch.testing.assert_close(value, agent.model.state_dict()[name])
+
+
+def test_reference_reset_updates_lifting_height_reference():
+    import ast
+    from pathlib import Path
+    source = Path(__file__).parents[1] / 'tasks/simtoolreal/env.py'
+    tree = ast.parse(source.read_text())
+    function = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == '_apply_reference_reset')
+    namespace = {'torch': torch}
+    module = ast.Module(body=[function], type_ignores=[])
+    exec(compile(ast.fix_missing_locations(module), str(source), 'exec'), namespace)
+    env = SimpleNamespace(
+        device='cpu', cfg={'env': {'referenceResetProbability': 1., 'tableObjectZOffset': .1}},
+        arm_hand_dof_pos=torch.zeros(2, 3), arm_hand_dof_vel=torch.zeros(2, 3),
+        prev_targets=torch.zeros(2, 3), cur_targets=torch.zeros(2, 3),
+        root_state_tensor=torch.zeros(4, 13), object_indices=torch.tensor([0, 2]),
+        table_indices=torch.tensor([1, 3]), lifted_object=torch.zeros(2, dtype=torch.bool),
+        table_init_state=torch.zeros(2, 13), object_init_state=torch.zeros(2, 13),
+        deferred_set_actor_root_state_tensor_indexed=lambda indices: None,
+    )
+    table = torch.zeros(1, 2, 13)
+    table[:, :, 2] = torch.tensor([.35, .37])
+    env.reference_reset_bank = dict(valid=torch.ones(1, 2, dtype=torch.bool),
+        joint_position=torch.ones(1, 2, 3), joint_velocity=torch.zeros(1, 2, 3),
+        target=torch.ones(1, 2, 3) * 2, object=torch.ones(1, 2, 13), table=table,
+        lifted=torch.ones(1, 2, dtype=torch.bool))
+    namespace['_apply_reference_reset'](env, torch.tensor([1]))
+    torch.testing.assert_close(env.object_init_state[1, 2], torch.tensor(.47))
+    torch.testing.assert_close(env.table_init_state[1, 2], env.root_state_tensor[3, 2])
+    assert env.object_init_state[0, 2] == 0
+    torch.testing.assert_close(env.prev_targets[1], torch.ones(3) * 2)

@@ -3710,10 +3710,25 @@ class SimToolReal(VecTask):
 
                 self.initial_state_idx += len(env_ids)
 
-        # Optional reference-state initialization uses states collected in this
-        # same scene, retaining each environment's object/actor indexing.
+        if episode_reset and tensor_reset:
+            self._apply_reference_reset(env_ids)
+
+        self.gym.set_dof_position_target_tensor_indexed(
+            self.sim,
+            gymtorch.unwrap_tensor(self.prev_targets),
+            gymtorch.unwrap_tensor(robot_indices),
+            len(env_ids),
+        )
+
+        self.deferred_set_dof_state_tensor_indexed([robot_indices])
+        self.deferred_set_actor_root_state_tensor_indexed(
+            self._extra_object_indices(env_ids)
+        )
+
+    def _apply_reference_reset(self, env_ids):
+        """Restore a same-scene reference pose and its reward height reference."""
         bank = getattr(self, "reference_reset_bank", None)
-        if bank is not None and episode_reset and tensor_reset and not self.cfg.get("test", False):
+        if bank is not None and not self.cfg.get("test", False):
             probability = self.cfg["env"].get("referenceResetProbability", 0.0)
             selected = env_ids[torch.rand(len(env_ids), device=self.device) < probability]
             weights = bank["valid"][:, selected].T.float()
@@ -3727,20 +3742,13 @@ class SimToolReal(VecTask):
                 self.cur_targets[selected] = self.prev_targets[selected]
                 self.root_state_tensor[self.object_indices[selected]] = bank["object"][snapshots, selected]
                 self.root_state_tensor[self.table_indices[selected]] = bank["table"][snapshots, selected]
+                # The lifting reward measures height relative to object_init_state.
+                # Keep its tabletop reference consistent with the restored table.
+                self.table_init_state[selected] = bank["table"][snapshots, selected]
+                self.object_init_state[selected, 2] = self.table_init_state[selected, 2] + self.cfg["env"]["tableObjectZOffset"]
                 self.lifted_object[selected] = bank["lifted"][snapshots, selected]
                 self.deferred_set_actor_root_state_tensor_indexed([self.object_indices[selected], self.table_indices[selected]])
 
-        self.gym.set_dof_position_target_tensor_indexed(
-            self.sim,
-            gymtorch.unwrap_tensor(self.prev_targets),
-            gymtorch.unwrap_tensor(robot_indices),
-            len(env_ids),
-        )
-
-        self.deferred_set_dof_state_tensor_indexed([robot_indices])
-        self.deferred_set_actor_root_state_tensor_indexed(
-            self._extra_object_indices(env_ids)
-        )
 
     def update_queue(
         self, queue: torch.Tensor, current_values: torch.Tensor
