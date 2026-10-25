@@ -121,3 +121,56 @@ def test_reference_reset_updates_lifting_height_reference():
     torch.testing.assert_close(env.table_init_state[1, 2], env.root_state_tensor[3, 2])
     assert env.object_init_state[0, 2] == 0
     torch.testing.assert_close(env.prev_targets[1], torch.ones(3) * 2)
+
+
+def test_total_reward_inference_uses_paired_valid_replay_and_frozen_model(tmp_path):
+    import json
+    import time
+    import pytest
+    from rl_games.algos_torch.fb_cpr_agent import FBcprPlayer
+    from rl_games.algos_torch.fb_networks import project_task
+
+    agent = make_agent(tmp_path)
+    agent.options.update(evaluation_command_mode='full_reward', inference_world_size=2,
+                         inference_samples=21, inference_seed=7300, inference_batch_size=4)
+    agent.run_started = time.monotonic()
+    checkpoint = agent.output_dir / 'nn/last.pt'
+    checkpoint.parent.mkdir(exist_ok=True)
+    agent.save(checkpoint)
+    status = {'state': 'trained', 'environment_steps': agent.frame,
+              'optimizer_step': agent.optimizer_step}
+    (agent.output_dir / 'status.json').write_text(json.dumps(status))
+    populations, means = [], []
+    for rank in range(2):
+        replay = TransitionReplay(12, 3, 4, 'cpu')
+        state = torch.full((4, 3, 20), float(rank + 1))
+        reward = torch.full((4, 3, 1), float(2 * rank - 1))
+        valid = torch.ones(4, 3, 1, dtype=torch.bool)
+        valid[:2 - rank] = False
+        reward[~valid] = 10000
+        replay.add({'next_state': state, 'reward': reward, 'valid': valid})
+        torch.save({'replay': replay.state_dict()}, checkpoint.with_name('last.rank' + str(rank) + '.replay.pt'))
+        populations.append(int(valid.sum()))
+        means.append(agent.model.backward(agent.state_normalizer(state[0, :1])).squeeze(0) * (2 * rank - 1))
+    before = {key: value.clone() for key, value in agent.model.state_dict().items()}
+    rng = torch.get_rng_state().clone()
+    FBcprPlayer._prepare_reward_command(agent)
+    expected = project_task(sum(mean * population for mean, population in zip(means, populations)) / sum(populations))
+    torch.testing.assert_close(agent.task_command, expected, atol=2e-6, rtol=2e-6)
+    assert torch.equal(rng, torch.get_rng_state())
+    for key, value in agent.model.state_dict().items():
+        torch.testing.assert_close(value, before[key], rtol=0, atol=0)
+    command = agent.task_command.clone()
+    FBcprPlayer._prepare_reward_command(agent)
+    torch.testing.assert_close(command, agent.task_command, rtol=0, atol=0)
+    pool = torch.load(checkpoint.parent / 'reward_inference/samples.pt')
+    assert sum(len(row['reward']) for row in pool['ranks']) == 21
+    assert all(row['valid'].bool().all() for row in pool['ranks'])
+    status['environment_steps'] += 1
+    (agent.output_dir / 'status.json').write_text(json.dumps(status))
+    with pytest.raises(ValueError, match='counters differ'):
+        FBcprPlayer._prepare_reward_command(agent)
+    status['state'] = 'running'
+    (agent.output_dir / 'status.json').write_text(json.dumps(status))
+    with pytest.raises(ValueError, match='coordinated save'):
+        FBcprPlayer._prepare_reward_command(agent)

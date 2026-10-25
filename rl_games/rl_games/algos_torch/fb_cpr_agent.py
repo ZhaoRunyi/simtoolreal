@@ -7,6 +7,8 @@ from the published SimToolReal PPO teacher, not synthesized from object goals.
 """
 
 import copy
+import fcntl
+import hashlib
 import json
 import math
 import time
@@ -424,10 +426,101 @@ class FBcprPlayer(FBcprAgent):
         super().__init__('fb_cpr_eval', params)
 
     @torch.no_grad()
+    def _prepare_reward_command(self):
+        mode = self.options.get('evaluation_command_mode', 'legacy')
+        self.reward_inference = {'mode': mode}
+        if mode == 'legacy':
+            return
+        if mode != 'full_reward':
+            raise ValueError('v2 replay supports original total reward inference only')
+        checkpoint = self.last_checkpoint.resolve()
+        status = json.loads((checkpoint.parent.parent / 'status.json').read_text())
+        if status['state'] not in ('trained', 'budget_stopped', 'iteration_limit'):
+            raise ValueError('Reward inference requires a completed coordinated save')
+        if status['environment_steps'] != self.frame or status['optimizer_step'] != self.optimizer_step:
+            raise ValueError('Training status and checkpoint counters differ')
+        world_size = self.options['inference_world_size']
+        count = self.options['inference_samples']
+        if world_size < 1 or count < world_size:
+            raise ValueError('Invalid replay inference sample counts')
+        paths = [checkpoint.with_name(checkpoint.stem + '.rank' + str(rank) + '.replay.pt')
+                 for rank in range(world_size)]
+        digest = hashlib.sha256()
+        with checkpoint.open('rb') as stream:
+            for block in iter(lambda: stream.read(8 * 1024 * 1024), b''):
+                digest.update(block)
+        sources = [{'path': str(path), 'bytes': path.stat().st_size,
+                    'mtime_ns': path.stat().st_mtime_ns} for path in paths]
+        identity = {'mode': mode, 'checkpoint_sha256': digest.hexdigest(),
+                    'frame': self.frame, 'optimizer_step': self.optimizer_step,
+                    'sources': sources, 'sample_count': count,
+                    'seed': self.options['inference_seed'], 'world_size': world_size}
+        destination = checkpoint.parent / 'reward_inference'
+        destination.mkdir(exist_ok=True)
+        bank_path = destination / 'full_reward.pt'
+        # All evaluation workers share one frozen inference result. No model,
+        # replay, optimizer or rollout RNG is modified by this preparation.
+        with (destination / 'full_reward.lock').open('a') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            bank = torch.load(bank_path, map_location='cpu') if bank_path.exists() else None
+            if bank is None or bank['identity'] != identity:
+                pools, populations, means = [], [], []
+                for rank, path in enumerate(paths):
+                    saved = torch.load(path, map_location='cpu')
+                    replay = TransitionReplay(1, 1, 1, 'cpu')
+                    replay.load_state_dict(saved['replay'])
+                    replay.storage = {key: value for key, value in replay.storage.items()
+                                      if key in ('next_state', 'reward', 'valid')}
+                    del saved
+                    population = sum(len(rows) for rows in replay.valid_indices[:replay.size])
+                    if population == 0:
+                        raise ValueError('Empty valid replay shard')
+                    generator = torch.Generator().manual_seed(identity['seed'] + rank)
+                    samples = count // world_size + int(rank < count % world_size)
+                    pool = replay.sample(samples, generator=generator)
+                    del replay
+                    if not pool['valid'].bool().all() or not all(torch.isfinite(value).all() for value in pool.values()):
+                        raise ValueError('Invalid reward inference samples')
+                    vector = torch.zeros(self.options['latent_size'], device=self.device)
+                    for start in range(0, samples, self.options['inference_batch_size']):
+                        stop = start + self.options['inference_batch_size']
+                        state = pool['next_state'][start:stop].to(self.device)
+                        reward = pool['reward'][start:stop].to(self.device)
+                        features = self.model.backward(self.state_normalizer(state))
+                        vector += (features * reward).sum(0)
+                    means.append(vector / samples)
+                    populations.append(population)
+                    pools.append({'rank': rank, 'population': population, **pool})
+                weights = torch.tensor(populations, device=self.device, dtype=torch.float64)
+                weights /= weights.sum()
+                vector = (torch.stack(means).double() * weights[:, None]).sum(0).float()
+                if not torch.isfinite(vector).all() or vector.norm() < 1e-8:
+                    raise ValueError('Zero or nonfinite inferred reward direction')
+                current_sources = [{'path': str(path), 'bytes': path.stat().st_size,
+                                    'mtime_ns': path.stat().st_mtime_ns} for path in paths]
+                if current_sources != sources:
+                    raise ValueError('Replay changed during reward inference')
+                metadata = {**identity, 'populations': populations,
+                            'unprojected_norm': float(vector.norm()),
+                            'reward_mean_per_rank': [float(pool['reward'].mean()) for pool in pools],
+                            'positive_reward_samples': [int((pool['reward'] > 0).sum()) for pool in pools],
+                            'definition': 'population-weighted rank means of B(next_state) times original recorded total transition reward; no reward clipping or centering',
+                            'replay_epoch_validation': 'completed trainer status after coordinated save barrier; legacy v2 shards do not contain counters'}
+                torch.save({'identity': identity, 'ranks': pools}, destination / 'samples.pt')
+                bank = {'identity': identity, 'metadata': metadata, 'command': project_task(vector).cpu()}
+                temporary = bank_path.with_suffix('.tmp')
+                torch.save(bank, temporary)
+                temporary.replace(bank_path)
+                bank_path.with_suffix('.json').write_text(json.dumps(metadata, indent=2, allow_nan=False))
+            self.task_command = bank['command'].to(self.device)
+            self.reward_inference = bank['metadata']
+
+    @torch.no_grad()
     def run(self):
         self.run_started = time.monotonic()
         self._initialize_rollout()
         self.model.eval()
+        self._prepare_reward_command()
         returns = torch.zeros(self.num_actors, device=self.device)
         records = []
         environment = self.vec_env.env
@@ -450,6 +543,7 @@ class FBcprPlayer(FBcprAgent):
             self.observations = {name: value.clone() for name, value in observations.items()}
             self.previous_action = action
         summary = {'episodes': len(records), 'records': records, 'steps': self.options['evaluation_steps'],
+                   'reward_inference': self.reward_inference,
                    'checkpoint': str(self.last_checkpoint), 'training_environment_steps': self.frame,
                    'object_name': environment.cfg['env']['objectName'],
                    'fixed_goal_path': environment.cfg['env'].get('fixedGoalStatesJsonPath'),

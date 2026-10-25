@@ -42,3 +42,10 @@ params:
       updates_per_iteration: 4
       max_seconds: 12600
       stop_on_slow: false
+      # Evaluation only: infer from the final coordinated replay, not the
+      # tracking command cached during training. Running learners are unchanged.
+      evaluation_command_mode: full_reward
+      inference_world_size: 4
+      inference_samples: 150000
+      inference_seed: 7300
+      inference_batch_size: 2048
