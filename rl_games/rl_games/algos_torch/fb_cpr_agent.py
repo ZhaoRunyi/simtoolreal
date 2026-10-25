@@ -24,6 +24,10 @@ from rl_games.algos_torch.fb_networks import project_task, successor_loss
 from rl_games.algos_torch.fb_cpr_networks import (
     BatchNormalizer, CPRModel, ExpertSequences, RewardNormalizer, TransitionReplay,
 )
+from rl_games.algos_torch.fb_task_inference import (
+    reward_components, infer_command_bank, checkpoint_digest,
+    select_phase_commands,
+)
 from rl_games.algos_torch.model_builder import ModelBuilder
 
 
@@ -50,10 +54,56 @@ class FBcprAgent(FBAgent):
             self.config['horizon_length'], self.device,
         )
         self.z_buffer = torch.empty(self.options['z_buffer_size'], self.options['latent_size'], device=self.device)
+        self.z_source_buffer = torch.zeros(self.options['z_buffer_size'], dtype=torch.long, device=self.device)
         self.z_position = 0
         self.z_size = 0
         self.experts = None
         self.expert_report = None
+
+    @torch.no_grad()
+    def save(self, filename, replay=False):
+        super().save(filename, replay=replay)
+        if not replay or not self.options.get('record_inference_pool', False):
+            return
+        self._save_inference_pool(filename)
+
+    @torch.no_grad()
+    def _save_inference_pool(self, filename):
+        # Snapshot the same valid replay population as the learner. Keep all
+        # training RNG streams unchanged by this evaluation-only operation.
+        population = sum(len(rows) for rows in self.replay.valid_indices[:self.replay.size])
+        counts = torch.zeros(self.world_size, dtype=torch.long, device=self.device)
+        counts[self.global_rank] = population
+        if self.world_size > 1:
+            distributed.all_reduce(counts)
+        total = int(counts.sum())
+        if total == 0:
+            raise ValueError('Cannot export an empty inference population')
+        requested = self.options['inference_samples']
+        allocation = (counts * requested) // total
+        remainder = requested - int(allocation.sum())
+        order = ((counts * requested) % total).argsort(descending=True)
+        allocation[order[:remainder]] += 1
+        count = int(allocation[self.global_rank])
+        generator = torch.Generator(device=self.device)
+        generator.manual_seed(self.options['inference_seed'] + self.global_rank)
+        batch = self.replay.sample(count, generator=generator)
+        if 'reward_components' not in batch:
+            raise ValueError('Replay lacks original reward components; v3 collection is required')
+        path = Path(filename).with_name(Path(filename).stem + '.rank' + str(self.global_rank) + '.inference.pt')
+        payload = {
+            'schema_version': 1, 'frame': self.frame, 'optimizer_step': self.optimizer_step,
+            'rank': self.global_rank, 'world_size': self.world_size, 'population': population,
+            'sample_count': count, 'seed': self.options['inference_seed'] + self.global_rank,
+            'reward_names': list(reward_components),
+            'next_state': batch['next_state'].cpu(),
+            'reward_components': batch['reward_components'].cpu(),
+        }
+        temporary = path.with_suffix('.tmp')
+        torch.save(payload, temporary)
+        temporary.replace(path)
+        if self.world_size > 1:
+            distributed.barrier()
 
     def _initialize_logging(self):
         super()._initialize_logging()
@@ -70,11 +120,18 @@ class FBcprAgent(FBAgent):
             'discriminator_optimizer': self.discriminator_optimizer.state_dict(),
             'action_normalizer': self.action_normalizer.state_dict(),
             'reward_normalizer': self.reward_normalizer.state_dict(),
+            'z_source_buffer': self.z_source_buffer,
             'z_buffer': self.z_buffer, 'z_position': self.z_position, 'z_size': self.z_size,
             'expert_report': self.expert_report,
+            'training_world_size': self.world_size,
         }
 
     def _restore_extra(self, checkpoint):
+        self.training_world_size = checkpoint.get('training_world_size')
+        if 'z_source_buffer' in checkpoint:
+            self.z_source_buffer.copy_(checkpoint['z_source_buffer'])
+        elif self.options.get('log_command_sources', False):
+            raise ValueError('Source-labelled rollout requires a v3 checkpoint')
         for name in ('style_optimizer', 'discriminator_optimizer', 'action_normalizer', 'reward_normalizer'):
             getattr(self, name).load_state_dict(checkpoint[name])
         for name in ('z_buffer', 'z_position', 'z_size', 'expert_report'):
@@ -179,14 +236,21 @@ class FBcprAgent(FBAgent):
     @torch.no_grad()
     def _sample_commands(self, count):
         if getattr(self, 'z_size', 0):
-            return self.z_buffer[torch.randint(self.z_size, (count,), device=self.device)].clone()
+            indices = torch.randint(self.z_size, (count,), device=self.device)
+            self.sampled_command_source = self.z_source_buffer[indices].clone()
+            return self.z_buffer[indices].clone()
+        self.sampled_command_source = torch.zeros(count, dtype=torch.long, device=self.device)
         return project_task(torch.randn(count, self.options['latent_size'], device=self.device))
 
     @torch.no_grad()
-    def _cache_commands(self, commands):
+    def _cache_commands(self, commands, sources=None):
         commands = commands[-len(self.z_buffer):]
+        if sources is None:
+            sources = torch.zeros(len(commands), dtype=torch.long, device=self.device)
+        sources = sources[-len(commands):]
         indices = (torch.arange(len(commands), device=self.device) + self.z_position) % len(self.z_buffer)
         self.z_buffer[indices] = commands
+        self.z_source_buffer[indices] = sources
         self.z_position = (self.z_position + len(commands)) % len(self.z_buffer)
         self.z_size = min(len(self.z_buffer), self.z_size + len(commands))
 
@@ -196,6 +260,7 @@ class FBcprAgent(FBAgent):
         self.history = torch.zeros(self.num_actors, self.options['history_steps'], self.observation_size, device=self.device)
         self.previous_action = torch.zeros(self.num_actors, self.action_size, device=self.device)
         self.rollout_command = self._sample_commands(self.num_actors)
+        self.rollout_command_source = self.sampled_command_source.clone()
         self.command_age = torch.zeros(self.num_actors, dtype=torch.long, device=self.device)
         self.reset_before = torch.ones(self.num_actors, dtype=torch.bool, device=self.device)
         self.history_reset = self.reset_before.clone()
@@ -217,6 +282,7 @@ class FBcprAgent(FBAgent):
         refresh = self.reset_before | (self.command_age >= self.options['command_steps'])
         candidates = self._sample_commands(self.num_actors)
         self.rollout_command = torch.where(refresh[:, None], candidates, self.rollout_command)
+        self.rollout_command_source = torch.where(refresh, self.sampled_command_source, self.rollout_command_source)
         self.command_age = torch.where(refresh, 0, self.command_age)
         length = self.options['tracking_length']
         if self.rollout_step % length == 0:
@@ -228,11 +294,13 @@ class FBcprAgent(FBAgent):
                 project_task(encoded[:, index:min(index + window, length)].mean(1)) for index in range(length)
             ], dim=1)
         self.rollout_command[self.tracking_indices] = self.tracking_prompts[:, self.rollout_step % length]
+        self.rollout_command_source[self.tracking_indices] = 3
 
     @torch.no_grad()
     def collect(self):
         records, episode_returns = [], []
         step_rewards, episode_rewards = {}, {}
+        command_metrics = {}
         environment = self.vec_env.env
         for _ in range(self.config['horizon_length']):
             self._rollout_prompts()
@@ -258,6 +326,18 @@ class FBcprAgent(FBAgent):
                 'discount': self.config['gamma'] * (~done).float().unsqueeze(-1),
                 'valid': (~self.reset_before).unsqueeze(-1).clone(),
             })
+            if self.options.get('record_inference_pool', False):
+                records[-1]['reward_components'] = torch.stack(
+                    [info['episode_cumulative'][name] for name in reward_components], dim=-1
+                ).clone()
+            if self.options.get('log_command_sources', False):
+                for source, name in enumerate(('random', 'replay_goal', 'expert_mean', 'expert_sequence')):
+                    mask = (self.rollout_command_source == source) & ~self.reset_before
+                    count_name = 'command_count/' + name
+                    command_metrics[count_name] = command_metrics.get(count_name, 0) + mask.sum()
+                    for term, value in info['episode_cumulative'].items():
+                        key = 'command_reward_sum/' + name + '/' + term
+                        command_metrics[key] = command_metrics.get(key, 0) + (value.reshape(-1) * mask).sum()
             self.episode_reward += reward.reshape(-1)
             episode_returns.append(self.episode_reward[done])
             for name, value in info.get('episode_cumulative', {}).items():
@@ -279,6 +359,7 @@ class FBcprAgent(FBAgent):
         returns = torch.cat(episode_returns)
         metrics = {'reward_step/' + name: torch.stack(values).mean() for name, values in step_rewards.items()}
         metrics.update({'reward_episode_sum/' + name: torch.stack(values).sum() for name, values in episode_rewards.items()})
+        metrics.update(command_metrics)
         metrics.update({
             'rollout/reward': block['reward'].mean(),
             'rollout/completed_episodes': reward.new_tensor(len(returns)),
@@ -339,7 +420,9 @@ class FBcprAgent(FBAgent):
             goals = project_task(self.model.backward(next_state[permutation]))
             command = torch.where(selector < .2, goals, command)
             command = torch.where((selector >= .2) & (selector < .8), expert_command[permutation], command)
-            self._cache_commands(command)
+            sources = torch.where(selector.squeeze(-1) < .2, 1,
+                                  torch.where(selector.squeeze(-1) < .8, 2, 0))
+            self._cache_commands(command, sources)
             relabel = torch.rand(count, 1, device=self.device) < self.options['relabel_probability']
             command = torch.where(relabel, command, batch['command'])
             next_action = self.model.actor.sample(next_history, command, self.options['exploration_std'], self.options['target_noise_clip'])
@@ -393,12 +476,13 @@ class FBcprAgent(FBAgent):
                 tau = self.options['target_tau'] if name in ('forward_maps', 'backward') else self.options['critic_target_tau']
                 for target, online in zip(getattr(self.target, name).parameters(), getattr(self.model, name).parameters()):
                     target.lerp_(online, tau)
-            distance = batch['next_observation'][:, self.goal_slice].reshape(-1, 4, 3).norm(dim=-1).amax(-1, keepdim=True)
-            weights = torch.exp(-distance / self.options['task_reward_temperature'])
-            task_vector = (self.model.backward(next_state) * weights).sum(0)
-            if self.world_size > 1:
-                distributed.all_reduce(task_vector)
-            self.task_command = project_task(task_vector)
+            if self.options.get('cache_tracking_command', True):
+                distance = batch['next_observation'][:, self.goal_slice].reshape(-1, 4, 3).norm(dim=-1).amax(-1, keepdim=True)
+                weights = torch.exp(-distance / self.options['task_reward_temperature'])
+                task_vector = (self.model.backward(next_state) * weights).sum(0)
+                if self.world_size > 1:
+                    distributed.all_reduce(task_vector)
+                self.task_command = project_task(task_vector)
             moment = backward.detach().T @ backward.detach() / count
             eigenvalues = torch.linalg.eigvalsh(moment)
             mean_action = self.model.actor(history, command)
@@ -424,10 +508,58 @@ class FBcprPlayer(FBcprAgent):
         super().__init__('fb_cpr_eval', params)
 
     @torch.no_grad()
+    def _prepare_task_commands(self):
+        mode = self.options.get('evaluation_command_mode', 'legacy')
+        if mode == 'legacy':
+            if not self.options.get('cache_tracking_command', True):
+                raise ValueError('Legacy task_command is disabled; infer a command bank')
+            return
+        if mode not in ('phased', 'full', 'grasp_lift', 'track'):
+            raise ValueError('Unknown evaluation command mode: ' + mode)
+        digest = checkpoint_digest(self.last_checkpoint)
+        bank_path = self.options.get('command_bank_path')
+        if bank_path:
+            bank = torch.load(bank_path, map_location='cpu')
+            if bank['checkpoint_sha256'] != digest:
+                raise ValueError('Command bank was encoded with a different checkpoint')
+        else:
+            import glob
+            pattern = self.options.get('inference_pool_glob') or str(
+                self.last_checkpoint.with_name(self.last_checkpoint.stem + '.rank*.inference.pt'))
+            bank = infer_command_bank(
+                self.model.backward, self.state_normalizer, sorted(glob.glob(pattern)),
+                self.frame, self.optimizer_step, self.device,
+                self.options['inference_method'], self.options['inference_temperature'],
+                self.options['inference_batch_size'],
+                self.training_world_size or self.options['inference_world_size'],
+            )
+            bank['checkpoint_sha256'] = digest
+            torch.save(bank, self.output_dir / 'command_bank.pt')
+        if bank['stage_names'] != ['grasp_lift', 'track', 'full']:
+            raise ValueError('Unexpected command bank phase ordering')
+        commands = bank['commands']
+        if commands.shape != (3, self.options['latent_size']) or not torch.isfinite(commands).all():
+            raise ValueError('Invalid command bank shape or values')
+        expected_norm = math.sqrt(self.options['latent_size'])
+        if not torch.allclose(commands.norm(dim=-1), commands.new_full((3,), expected_norm)):
+            raise ValueError('Command bank directions are not projected to the latent sphere')
+        self.command_bank = commands.to(self.device)
+        self.command_bank_metadata = {key: value for key, value in bank.items() if key != 'commands'}
+        (self.output_dir / 'command_inference.json').write_text(
+            json.dumps(self.command_bank_metadata, indent=2, allow_nan=False))
+
+    def _evaluation_commands(self, environment):
+        mode = self.options.get('evaluation_command_mode', 'legacy')
+        if mode == 'legacy':
+            return self.task_command.expand(self.num_actors, -1)
+        return select_phase_commands(self.command_bank, environment.lifted_object, mode)
+
+    @torch.no_grad()
     def run(self):
         self.run_started = time.monotonic()
         self._initialize_rollout()
         self.model.eval()
+        self._prepare_task_commands()
         returns = torch.zeros(self.num_actors, device=self.device)
         records = []
         environment = self.vec_env.env
@@ -435,7 +567,7 @@ class FBcprPlayer(FBcprAgent):
             self.history[self.history_reset] = 0
             self.previous_action[self.history_reset] = 0
             self.history = torch.cat((self.history[:, 1:], self.observations['obs'][:, None]), dim=1)
-            command = self.task_command.expand(self.num_actors, -1)
+            command = self._evaluation_commands(environment)
             action = self.model.actor(self._history_input(self.history, self.previous_action), command)
             observations, reward, done, info = self.vec_env.step(action)
             returns += reward.reshape(-1)
@@ -454,7 +586,9 @@ class FBcprPlayer(FBcprAgent):
                    'object_name': environment.cfg['env']['objectName'],
                    'fixed_goal_path': environment.cfg['env'].get('fixedGoalStatesJsonPath'),
                    'evaluation_tolerance': float(environment.success_tolerance),
-                   'schema': {'observation': self.observation_size, 'state': self.state_size, 'action': self.action_size}}
+                   'schema': {'observation': self.observation_size, 'state': self.state_size, 'action': self.action_size},
+                   'command_mode': self.options.get('evaluation_command_mode', 'legacy'),
+                   'command_bank': getattr(self, 'command_bank_metadata', None)}
         for name in ('return', 'successes', 'goal_fraction'):
             summary['mean_' + name] = float(np.mean([row[name] for row in records])) if records else None
         (self.output_dir / 'evaluation.json').write_text(json.dumps(summary, indent=2, allow_nan=False))

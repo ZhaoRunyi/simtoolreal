@@ -329,3 +329,41 @@ saves per-rank expert files under the normal run directory and validates contigu
 expert sequences before learner updates. Evaluation does not load reference resets.
 BFM-Zero-derived network/loss components carry the upstream CC BY-NC 4.0 notice in
 [docs/licenses/bfm-zero-LICENSE](docs/licenses/bfm-zero-LICENSE).
+
+### FB v3: replay reward inference and phase commands
+
+Branch `fb-v3` retains the v2 learning configuration and aux Q. It disables the
+cached tracking command, exports a uniformly sampled replay inference pool on
+coordinated saves, and evaluates full-reward versus pre/post-lift commands.
+[Design](../doc/D-BFM/v3/simtoolreal_fb_v3.md),
+[execution/results](../doc/D-BFM/v3/simtoolreal_fb_v3_results.md).
+
+Use the existing uv-managed interpreter with this worktree's modules. Within a
+four-GPU PBS allocation, use the v2 launch command above with
+`train=SimToolRealFBV3 experiment=bfm_v3
+train.params.config.train_dir=train_dir/dbfm-v3`. Global batch is 24576,
+four updates per 16-step rollout, and target training volume is 2B transitions.
+
+After a coordinated model/replay save, infer commands without creating a simulator:
+
+```bash
+export PYTHONPATH="$PWD:$PWD/rl_games"
+/home/MLTL-INTERN/shaoyang/zvi/dex_fb_ws/SimToolReal-fb/.venv/bin/python \
+  -m rl_games.algos_torch.fb_task_inference \
+  --checkpoint train_dir/dbfm-v3/bfm_v3/nn/last.pt \
+  --pool-glob 'train_dir/dbfm-v3/bfm_v3/nn/last.rank*.inference.pt' \
+  --output train_dir/dbfm-v3/commands/mean.pt
+```
+
+This command defaults to CPU; add `--device cuda:0` only in an allocated PBS job.
+`--method reward_weighted --temperature 0.1` enables the I-BFM weighted interface.
+The JSON sidecar records checkpoint/pool hashes, reward support and concentration.
+Missing phase reward evidence causes an explicit inference failure.
+
+Use the normal `isaacgymenvs.train test=True` player with `train=SimToolRealFBV3`,
+the same checkpoint, `train.params.config.fb.command_bank_path=/absolute/path/mean.pt`,
+and `train.params.config.fb.evaluation_command_mode=full` or `phased`.
+The evaluation output records the command definition and provenance. Do not use
+reference resets for the standard task comparison. Training reward telemetry is
+additionally split by command source under `command_reward_step/`; it is not a
+per-task success rate.

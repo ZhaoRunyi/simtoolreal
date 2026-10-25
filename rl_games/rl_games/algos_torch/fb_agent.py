@@ -392,9 +392,15 @@ class FBAgent:
         if self.world_size > 1:
             distributed.all_reduce(values)
             for index, name in enumerate(names):
-                if name not in ("rollout/completed_episodes", "rollout/episode_return_sum") and not name.startswith("reward_episode_sum/"):
+                if name not in ("rollout/completed_episodes", "rollout/episode_return_sum") and not name.startswith(("reward_episode_sum/", "command_count/", "command_reward_sum/")):
                     values[index].div_(self.world_size)
         result = {name: float(value) for name, value in zip(names, values.cpu())}
+        for name, value in list(result.items()):
+            if name.startswith("command_reward_sum/"):
+                source, term = name[len("command_reward_sum/"):].split("/", 1)
+                count = result.get("command_count/" + source, 0)
+                if count > 0:
+                    result["command_reward_step/" + source + "/" + term] = value / count
         if result.get("rollout/completed_episodes", 0) > 0:
             result["rollout/episode_return"] = result["rollout/episode_return_sum"] / result["rollout/completed_episodes"]
         if not all(np.isfinite(value) for value in result.values()):
@@ -432,7 +438,8 @@ class FBAgent:
                 "representation_optimizer": self.representation_optimizer.state_dict(),
                 "auxiliary_optimizer": self.auxiliary_optimizer.state_dict(),
                 "frame": self.frame, "epoch": self.epoch_num, "optimizer_step": self.optimizer_step,
-                "task_command": self.task_command, "options": self.options,
+                "task_command": self.task_command if self.options.get("cache_tracking_command", True) else None,
+                "options": self.options,
                 "elapsed": self.elapsed_before_resume + time.monotonic() - self.run_started,
                 "schema": {"observation": self.observation_size, "state": self.state_size, "action": self.action_size},
             }
@@ -442,6 +449,7 @@ class FBAgent:
         if replay:
             shard = filename.with_name(filename.stem + ".rank" + str(self.global_rank) + ".replay.pt")
             torch.save({
+                "frame": self.frame, "optimizer_step": self.optimizer_step, "epoch": self.epoch_num,
                 "replay": self.replay.state_dict(), "rng": torch.get_rng_state(),
                 "cuda_rng": torch.cuda.get_rng_state(self.device), "numpy_rng": np.random.get_state(),
                 "python_rng": random.getstate(), "environment": self.vec_env.get_env_state(),

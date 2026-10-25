@@ -204,7 +204,7 @@ class TransitionReplay:
         if self.storage is None:
             self.storage = {
                 name: torch.empty((self.capacity,) + value.shape,
-                                  dtype=torch.float16 if value.is_floating_point() and name not in ('reward', 'discount') else value.dtype,
+                                  dtype=torch.float16 if value.is_floating_point() and name not in ('reward', 'discount', 'reward_components') else value.dtype,
                                   device=self.device)
                 for name, value in block.items()
             }
@@ -214,10 +214,10 @@ class TransitionReplay:
         self.position = (self.position + 1) % self.capacity
         self.size = min(self.size + 1, self.capacity)
 
-    def sample(self, count):
+    def sample(self, count, generator=None):
         lengths = torch.tensor([len(indices) for indices in self.valid_indices[:self.size]], device=self.device)
         offsets = lengths.cumsum(0)
-        selected = torch.randint(int(offsets[-1]), (count,), device=self.device)
+        selected = torch.randint(int(offsets[-1]), (count,), device=self.device, generator=generator)
         blocks = torch.searchsorted(offsets, selected, right=True)
         starts = offsets - lengths
         local = selected - starts[blocks]
