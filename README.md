@@ -233,15 +233,32 @@ This retains training-style noise and the 600-step horizon. The official
 `dextoolbench/eval_isaacgym.py` protocol changes additional settings; report
 the two protocols separately.
 
+To record an MP4 through the existing camera recorder, add these evaluation
+overrides inside a PBS allocation:
+
+```bash
+graphics_device_id=0 task.env.enableCameraSensors=True \
+task.env.capture_video=True task.env.capture_video_freq=1 \
+task.env.capture_video_len=600 train.params.config.fb.evaluation_steps=1200
+```
+
+Set `hydra.run.dir` to the desired normal run directory, such as
+`train_dir/dbfm-v1/aux/video_eval/claw_hammer/swing_down`; the recorder writes
+`videos/*.mp4` there. The original recorder starts after an environment reset,
+so 1,200 evaluation steps allow a full recording while retaining the original
+600-step episode horizon. Its headless path removes the first captured frame;
+validate the actual encoded frame count and FPS. Keep these extended camera
+recordings separate from the original 600-step numerical evaluation.
+
 The design/implementation audit lives in the workspace's
-`doc/D-BFM/designs/simtoolreal_fb_v1.md`.
+`doc/D-BFM/v1/simtoolreal_fb_v1.md`.
 
 The first formal matrix completed 2,000,289,792 transitions per variant on
 2026-10-25, with recorded training times of 2.492 hours (pure) and 2.757 hours
 (aux). All 50 evaluation cases were valid, covering 2,334 completed episodes;
 neither variant completed a goal under the noisy stress protocol. Detailed
 results, checkpoint audits and data-coverage measurements are in the workspace's
-`doc/D-BFM/designs/simtoolreal_fb_v1_results.md`.
+`doc/D-BFM/v1/simtoolreal_fb_v1_results.md`.
 
 # Formatting
 
