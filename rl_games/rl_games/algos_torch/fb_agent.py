@@ -188,6 +188,8 @@ class FBAgent:
         initial_state = tuple(value.clone() for value in self.actor_state)
         records = []
         episode_returns = []
+        reward_steps = {}
+        reward_episodes = {}
         environment = self.vec_env.env
         for _ in range(self.config["horizon_length"]):
             refresh = self.reset_before | (self.command_age >= self.options["command_steps"])
@@ -219,6 +221,12 @@ class FBAgent:
             records.append(record)
             self.episode_reward += reward.reshape(-1)
             finished = done.bool()
+            # Environment supplies weighted step components and cumulative raw /
+            # weighted episode components. Read before the next reset clears them.
+            for name, value in info.get("episode_cumulative", {}).items():
+                reward_steps.setdefault(name, []).append(value.detach().mean())
+            for name, value in info.get("rewards_episode", {}).items():
+                reward_episodes.setdefault(name, []).append(value.detach()[finished].sum())
             episode_returns.append(self.episode_reward[finished])
             self.episode_reward.masked_fill_(finished, 0)
             self.reset_before = finished
@@ -234,7 +242,16 @@ class FBAgent:
         self.previous_initial_state = initial_state
         self.frame += self.num_actors * self.config["horizon_length"] * self.world_size
         valid_returns = torch.cat(episode_returns)
+        reward_metrics = {
+            "reward_step/" + name: torch.stack(values).mean()
+            for name, values in reward_steps.items()
+        }
+        reward_metrics.update({
+            "reward_episode_sum/" + name: torch.stack(values).sum()
+            for name, values in reward_episodes.items()
+        })
         return {
+            **reward_metrics,
             "rollout/reward": block["reward"].mean(),
             "rollout/completed_episodes": torch.tensor(valid_returns.numel(), device=self.device),
             "rollout/episode_return_sum": valid_returns.sum(),
@@ -373,13 +390,16 @@ class FBAgent:
         if self.world_size > 1:
             distributed.all_reduce(values)
             for index, name in enumerate(names):
-                if name not in ("rollout/completed_episodes", "rollout/episode_return_sum"):
+                if name not in ("rollout/completed_episodes", "rollout/episode_return_sum") and not name.startswith("reward_episode_sum/"):
                     values[index].div_(self.world_size)
         result = {name: float(value) for name, value in zip(names, values.cpu())}
         if result.get("rollout/completed_episodes", 0) > 0:
             result["rollout/episode_return"] = result["rollout/episode_return_sum"] / result["rollout/completed_episodes"]
         if not all(np.isfinite(value) for value in result.values()):
             raise FloatingPointError("Nonfinite diagnostic metric")
+        for name, value in list(result.items()):
+            if name.startswith("reward_episode_sum/") and result.get("rollout/completed_episodes", 0) > 0:
+                result[name.replace("reward_episode_sum/", "reward_episode/")] = value / result["rollout/completed_episodes"]
         if self.global_rank == 0:
             result.update(environment_steps=self.frame, optimizer_step=self.optimizer_step, epoch=self.epoch_num)
             with (self.output_dir / "metrics.jsonl").open("a") as stream:
