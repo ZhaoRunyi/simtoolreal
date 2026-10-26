@@ -13,6 +13,8 @@ from pathlib import Path
 
 import numpy as np
 import torch
+
+from rl_games.algos_torch.fb_evaluation import EvaluationRecorder
 import torch.distributed as distributed
 from torch import nn
 from torch.utils.tensorboard import SummaryWriter
@@ -106,7 +108,8 @@ class FBAgent:
         observer = self.config.get("features", {}).get("observer")
         if observer is not None:
             observer.before_init("fb", self.config, self.config["name"])
-        self.writer = SummaryWriter(str(self.output_dir / "summaries"))
+        if not self.vec_env.env.cfg.get("test", False):
+            self.writer = SummaryWriter(str(self.output_dir / "summaries"))
         (self.output_dir / "learner_config.json").write_text(json.dumps(self.params, default=str, indent=2))
 
     def _status(self, state, **metrics):
@@ -554,6 +557,7 @@ class FBPlayer(FBAgent):
 
     @torch.no_grad()
     def run(self):
+        self.vec_env.env.cfg["env"]["capture_viewer"] = False
         self.run_started = time.monotonic()
         self._initialize_rollout()
         self.model.eval()
@@ -561,6 +565,7 @@ class FBPlayer(FBAgent):
         completed = []
         steps = self.options["evaluation_steps"]
         environment = self.vec_env.env
+        recorder = EvaluationRecorder(self)
         for step in range(steps):
             memory, self.actor_state = self.model.actor.encode(
                 self.observation_normalizer(self.observations["obs"]).unsqueeze(0),
@@ -593,6 +598,7 @@ class FBPlayer(FBAgent):
             "evaluation_tolerance": float(environment.success_tolerance),
             "schema": {"observation": self.observation_size, "state": self.state_size, "action": self.action_size},
         }
+        recorder.finish(summary)
         (self.output_dir / "evaluation.json").write_text(json.dumps(summary, indent=2, allow_nan=False))
         self._status("evaluated", episodes=len(completed), mean_successes=summary["mean_successes"])
         print(json.dumps({key: value for key, value in summary.items() if key != "records"}), flush=True)
