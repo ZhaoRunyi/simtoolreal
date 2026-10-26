@@ -121,3 +121,49 @@ def test_reference_reset_updates_lifting_height_reference():
     torch.testing.assert_close(env.table_init_state[1, 2], env.root_state_tensor[3, 2])
     assert env.object_init_state[0, 2] == 0
     torch.testing.assert_close(env.prev_targets[1], torch.ones(3) * 2)
+
+
+def test_actor_gradient_monitor_preserves_update_and_rng(tmp_path):
+    import copy
+    torch.manual_seed(127)
+    agent = make_agent(tmp_path / 'plain')
+    agent.replay.add({
+        'observation': torch.randn(4, 3, 16), 'next_observation': torch.randn(4, 3, 16),
+        'state': torch.randn(4, 3, 20), 'next_state': torch.randn(4, 3, 20),
+        'history': torch.randn(4, 3, 64), 'next_history': torch.randn(4, 3, 64),
+        'previous_action': torch.randn(4, 3, 3), 'action': torch.randn(4, 3, 3).tanh(),
+        'command': torch.randn(4, 3, 4), 'reward': torch.randn(4, 3, 1),
+        'auxiliary_reward': -torch.rand(4, 3, 1),
+        'discount': torch.ones(4, 3, 1) * .98, 'valid': torch.ones(4, 3, 1, dtype=torch.bool),
+    })
+    monitored = copy.deepcopy(agent)
+    monitored.options['actor_gradient_probe_every'] = 1
+    initial_rng = torch.get_rng_state()
+    baseline_metrics = agent.update()
+    final_rng = torch.get_rng_state()
+    torch.set_rng_state(initial_rng)
+    metrics = monitored.update()
+    assert torch.equal(final_rng, torch.get_rng_state())
+    for name, parameter in agent.model.state_dict().items():
+        torch.testing.assert_close(parameter, monitored.model.state_dict()[name], rtol=0, atol=0)
+    for name, value in baseline_metrics.items():
+        torch.testing.assert_close(value, metrics[name], rtol=0, atol=0)
+    for name in ['fb_norm', 'style_norm', 'auxiliary_norm', 'fb_style_cosine',
+                 'fb_auxiliary_cosine', 'fb_total_cosine', 'fb_update_cosine', 'update_norm']:
+        assert torch.isfinite(metrics['actor_grad/' + name])
+    assert metrics['actor_grad/update_norm'] > 0
+
+
+def test_actor_gradient_probe_survives_sparse_log_interval(tmp_path, monkeypatch):
+    from rl_games.algos_torch.fb_agent import FBAgent
+    agent = make_agent(tmp_path)
+    expected = {'actor_grad/probe_optimizer_step': torch.tensor(1025.),
+                'actor_grad/fb_norm': torch.tensor(3.)}
+    agent.pending_actor_gradient_metrics = expected.copy()
+    captured = []
+    monkeypatch.setattr(FBAgent, '_log', lambda self, metrics: captured.append(metrics) or metrics)
+    first = agent._log({'optimizer_step': torch.tensor(1040.)})
+    assert first['actor_grad/probe_optimizer_step'] == 1025
+    assert first['optimizer_step'] == 1040
+    agent._log({'optimizer_step': torch.tensor(1200.)})
+    assert 'actor_grad/fb_norm' not in captured[1]

@@ -295,6 +295,56 @@ class FBcprAgent(FBAgent):
                                      + self.options['auxiliary_coefficient'] * q_auxiliary.mean())
         return loss, q_fb, q_style, q_auxiliary
 
+    def _actor_gradient_probe(self, q_fb, q_style, q_auxiliary):
+        """Measure weighted branch gradients on the actual sampled actor graph.
+
+        This does not populate .grad, draw samples, or step an optimizer. Average
+        vectors across ranks before comparing them, as in the production update.
+        """
+        parameters = tuple(self.model.actor.parameters())
+        scale = q_fb.detach().abs().mean()
+        losses = {
+            'fb': -q_fb.mean(),
+            'style': -scale * self.options['style_coefficient'] * q_style.mean(),
+            'auxiliary': -scale * self.options['auxiliary_coefficient'] * q_auxiliary.mean(),
+        }
+        vectors = {}
+        for name, loss in losses.items():
+            gradients = torch.autograd.grad(loss, parameters, retain_graph=True)
+            vector = torch.cat([gradient.detach().reshape(-1) for gradient in gradients])
+            if self.world_size > 1:
+                distributed.all_reduce(vector)
+                vector.div_(self.world_size)
+            vectors[name] = vector
+        before = torch.cat([parameter.detach().reshape(-1) for parameter in parameters])
+        return vectors, before
+
+    @torch.no_grad()
+    def _actor_gradient_metrics(self, vectors, before):
+        """Compare branches with the total gradient and actual Adam change."""
+        parameters = tuple(self.model.actor.parameters())
+        actual_update = torch.cat([parameter.detach().reshape(-1) for parameter in parameters]) - before
+        # .grad has already been averaged and clipped by the production step.
+        clipped_gradient = torch.cat([parameter.grad.reshape(-1) for parameter in parameters])
+        metrics = {'actor_grad/update_norm': actual_update.norm()}
+        for name, vector in vectors.items():
+            metrics['actor_grad/' + name + '_norm'] = vector.norm()
+            metrics['actor_grad/' + name + '_update_cosine'] = functional.cosine_similarity(
+                -vector, actual_update, dim=0)
+        for left, right in (('fb', 'style'), ('fb', 'auxiliary'), ('style', 'auxiliary')):
+            metrics['actor_grad/' + left + '_' + right + '_cosine'] = functional.cosine_similarity(
+                vectors[left], vectors[right], dim=0)
+        metrics['actor_grad/fb_total_cosine'] = functional.cosine_similarity(
+            vectors['fb'], clipped_gradient, dim=0)
+        return metrics
+
+    def _log(self, metrics):
+        # Probes need not coincide with log_interval; preserve their exact step.
+        metrics = {**metrics, **getattr(self, 'pending_actor_gradient_metrics', {})}
+        result = super()._log(metrics)
+        self.pending_actor_gradient_metrics = {}
+        return result
+
     @torch.no_grad()
     def _rollout_prompts(self):
         refresh = self.reset_before | (self.command_age >= self.options['command_steps'])
@@ -484,6 +534,9 @@ class FBcprAgent(FBAgent):
         for parameter in critics:
             parameter.requires_grad_(False)
         actor_loss, q_fb, q_style, q_auxiliary = self._actor_objective(state, history, command)
+        probe_every = self.options.get('actor_gradient_probe_every', 0)
+        probe = self._actor_gradient_probe(q_fb, q_style, q_auxiliary) if (
+            probe_every > 0 and self.optimizer_step % probe_every == 0) else None
         self.actor_optimizer.zero_grad(set_to_none=True)
         self._backward_loss(actor_loss)
         actor_loss = actor_loss.detach()
@@ -514,6 +567,12 @@ class FBcprAgent(FBAgent):
                 metrics.update({'loss/logo_local': local_loss.detach(), 'loss/logo_goal': goal_loss.detach(),
                                 'loss/logo_scaled': self.options['logo_coefficient'] * pair_loss.detach()})
         actor_grad = self._step_accumulated_gradients(self.actor_optimizer, self.model.actor.parameters())
+        if probe is not None:
+            probe_metrics = self._actor_gradient_metrics(*probe)
+            probe_metrics['actor_grad/probe_optimizer_step'] = actor_grad.new_tensor(self.optimizer_step + 1)
+            probe_metrics['actor_grad/probe_environment_steps'] = actor_grad.new_tensor(self.frame)
+            self.pending_actor_gradient_metrics = probe_metrics
+            metrics.update(probe_metrics)
         for parameter in critics:
             parameter.requires_grad_(True)
         with torch.no_grad():

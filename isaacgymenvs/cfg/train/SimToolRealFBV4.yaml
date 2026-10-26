@@ -21,5 +21,7 @@ params:
       replay_capacity: 20480000
       warmup_blocks: 64
       updates_per_iteration: 16
+      # Diagnostic only: actual weighted actor gradients and Adam update alignment.
+      actor_gradient_probe_every: 1024
       # First tranche for measured quality/debug review, then resume if useful.
       max_seconds: 12600
