@@ -14,6 +14,8 @@ from pathlib import Path
 
 import numpy as np
 import torch
+
+from rl_games.algos_torch.fb_evaluation import EvaluationRecorder
 import torch.distributed as distributed
 from torch import nn
 from torch.nn import functional
@@ -556,6 +558,7 @@ class FBcprPlayer(FBcprAgent):
 
     @torch.no_grad()
     def run(self):
+        self.vec_env.env.cfg["env"]["capture_viewer"] = False
         self.run_started = time.monotonic()
         self._initialize_rollout()
         self.model.eval()
@@ -563,6 +566,7 @@ class FBcprPlayer(FBcprAgent):
         returns = torch.zeros(self.num_actors, device=self.device)
         records = []
         environment = self.vec_env.env
+        recorder = EvaluationRecorder(self)
         for step in range(self.options['evaluation_steps']):
             self.history[self.history_reset] = 0
             self.previous_action[self.history_reset] = 0
@@ -591,6 +595,7 @@ class FBcprPlayer(FBcprAgent):
                    'command_bank': getattr(self, 'command_bank_metadata', None)}
         for name in ('return', 'successes', 'goal_fraction'):
             summary['mean_' + name] = float(np.mean([row[name] for row in records])) if records else None
+        recorder.finish(summary)
         (self.output_dir / 'evaluation.json').write_text(json.dumps(summary, indent=2, allow_nan=False))
         self._status('evaluated', episodes=len(records), mean_successes=summary['mean_successes'])
         return summary
