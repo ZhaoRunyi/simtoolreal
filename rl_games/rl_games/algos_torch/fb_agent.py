@@ -108,7 +108,8 @@ class FBAgent:
         observer = self.config.get("features", {}).get("observer")
         if observer is not None:
             observer.before_init("fb", self.config, self.config["name"])
-        self.writer = SummaryWriter(str(self.output_dir / "summaries"))
+        if not self.vec_env.env.cfg.get("test", False):
+            self.writer = SummaryWriter(str(self.output_dir / "summaries"))
         (self.output_dir / "learner_config.json").write_text(json.dumps(self.params, default=str, indent=2))
 
     def _status(self, state, **metrics):

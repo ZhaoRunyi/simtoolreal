@@ -4956,15 +4956,13 @@ class SimToolReal(VecTask):
             )
             print("-" * 80)
             self.video_frames = []
-            return
 
         should_start_video_capture_now = (
             self.video_frames is not None
             and len(self.video_frames) == 0
-            # and self.progress_buf[self.index_to_view].item() <= 1  # Only start video capture on first step of episode so that videos don't start in the middle of an episode
-            # Actually doesn't work because progress_buf gets reset to 0 not only at start of episode but on success
-            and self.reset_buf[self.index_to_view].item()
-            == 1  # Only start video capture after reset of an env
+            # Include the initial episode so a 600-step eval completes its recording.
+            and (self.control_steps == 0 or self.progress_buf[self.index_to_view].item() <= 1
+                 or self.reset_buf[self.index_to_view].item() == 1)  # Only start video capture after reset of an env
         )
         video_capture_in_progress = (
             self.video_frames is not None and len(self.video_frames) > 0
