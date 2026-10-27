@@ -1,0 +1,12 @@
+defaults:
+  - SimToolRealFBV4
+  - _self_
+
+params:
+  config:
+    name: ${resolve_default:SimToolRealFBV5,${....experiment}}
+    fb:
+      # Match the completed v4 sample/update budget, not its nominal 2B target.
+      target_frames: 19120128
+      # Safety deadline only; stop normally at target_frames.
+      max_seconds: 21600
