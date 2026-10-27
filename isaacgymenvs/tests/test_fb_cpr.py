@@ -167,3 +167,22 @@ def test_actor_gradient_probe_survives_sparse_log_interval(tmp_path, monkeypatch
     assert first['optimizer_step'] == 1040
     agent._log({'optimizer_step': torch.tensor(1200.)})
     assert 'actor_grad/fb_norm' not in captured[1]
+
+
+def test_auxiliary_soft_limits_preserve_original_reward_and_have_correct_units(tmp_path):
+    agent = make_agent(tmp_path)
+    agent.options['auxiliary_reward_terms'] = ['velocity']
+    components = {'velocity': torch.tensor([-2., -3., -4.])}
+    environment = SimpleNamespace(
+        arm_hand_dof_lower_limits=torch.tensor([-1., -2.]),
+        arm_hand_dof_upper_limits=torch.tensor([1., 2.]),
+        arm_hand_dof_pos=torch.tensor([[0., 0.], [.95, -1.9], [1., -2.]]),
+    )
+    legacy, penalty = agent._auxiliary_reward(environment, components)
+    torch.testing.assert_close(legacy, components['velocity'])
+    assert not penalty.any()
+    agent.options.update(joint_limit_coefficient=10., soft_joint_limit_fraction=.95)
+    reward, penalty = agent._auxiliary_reward(environment, components)
+    torch.testing.assert_close(penalty, torch.tensor([0., 0., -1.5]))
+    torch.testing.assert_close(reward, torch.tensor([-2., -3., -5.5]))
+    torch.testing.assert_close(components['velocity'], torch.tensor([-2., -3., -4.]))

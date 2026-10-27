@@ -5022,7 +5022,9 @@ class SimToolReal(VecTask):
             import wandb
 
             imageio.mimsave(
-                video_path, self.video_frames, fps=int(1.0 / self.control_dt)
+                video_path, self.video_frames, fps=int(1.0 / self.control_dt),
+                codec="libx264", pixelformat="yuv420p",
+                output_params=["-movflags", "+faststart"],
             )
             if wandb.run is not None:
                 wandb_video = wandb.Video(

@@ -364,6 +364,24 @@ class FBcprAgent(FBAgent):
         self.rollout_command[self.tracking_indices] = self.tracking_prompts[:, self.rollout_step % length]
         self.rollout_command_source[self.tracking_indices] = 3
 
+    def _auxiliary_reward(self, environment, components):
+        reward = sum(components[name] for name in self.options['auxiliary_reward_terms'])
+        limit_reward = torch.zeros_like(reward)
+        coefficient = self.options.get('joint_limit_coefficient', 0.0)
+        if coefficient:
+            fraction = self.options.get('soft_joint_limit_fraction', 0.95)
+            if coefficient < 0 or not 0 < fraction <= 1:
+                raise ValueError('Joint limit coefficient must be nonnegative and soft fraction in (0, 1]')
+            lower = environment.arm_hand_dof_lower_limits
+            upper = environment.arm_hand_dof_upper_limits
+            center = (lower + upper) * 0.5
+            radius = (upper - lower) * (0.5 * fraction)
+            position = environment.arm_hand_dof_pos
+            violation = (center - radius - position).clamp_min(0)
+            violation += (position - center - radius).clamp_min(0)
+            limit_reward = -coefficient * violation.sum(-1)
+        return reward + limit_reward, limit_reward
+
     @torch.no_grad()
     def collect(self):
         records, episode_returns = [], []
@@ -384,13 +402,15 @@ class FBcprAgent(FBAgent):
             observations = {key: value.clone() for key, value in observations.items()}
             done = done.bool()
             next_history = torch.cat((history[:, 1:], observations['obs'][:, None]), dim=1)
+            auxiliary_reward, joint_limit_reward = self._auxiliary_reward(environment, info['episode_cumulative'])
+            step_rewards.setdefault('aux_joint_limit', []).append(joint_limit_reward.mean().detach())
             records.append({
                 'observation': current['obs'], 'state': current['states'],
                 'next_observation': observations['obs'], 'next_state': observations['states'],
                 'history': history.flatten(1), 'next_history': next_history.flatten(1),
                 'previous_action': previous_action, 'action': action,
                 'command': self.rollout_command.clone(), 'reward': reward.reshape(-1, 1).clone(),
-                'auxiliary_reward': sum(info['episode_cumulative'][name] for name in self.options['auxiliary_reward_terms']).reshape(-1, 1).clone(),
+                'auxiliary_reward': auxiliary_reward.reshape(-1, 1).clone(),
                 'discount': self.config['gamma'] * (~done).float().unsqueeze(-1),
                 'valid': (~self.reset_before).unsqueeze(-1).clone(),
             })

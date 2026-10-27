@@ -23,5 +23,9 @@ params:
       updates_per_iteration: 16
       # Diagnostic only: actual weighted actor gradients and Adam update alignment.
       actor_gradient_probe_every: 1024
+      # Prospective training change; relabel old auxiliary replay before resuming.
+      # I-BFM soft-limit violation in radians; original PPO reward is unchanged.
+      soft_joint_limit_fraction: 0.95
+      joint_limit_coefficient: 10.0
       # First tranche for measured quality/debug review, then resume if useful.
       max_seconds: 12600
