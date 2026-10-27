@@ -1,0 +1,10 @@
+defaults:
+  - SimToolRealFBV5
+  - _self_
+
+params:
+  config:
+    name: ${resolve_default:SimToolRealFBV6,${....experiment}}
+    fb:
+      # Isolate the style contribution to the actor; preserve all other paths.
+      style_coefficient: 0.0
