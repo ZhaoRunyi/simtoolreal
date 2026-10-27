@@ -1,0 +1,12 @@
+defaults:
+  - SimToolRealFBV4
+  - _self_
+
+params:
+  config:
+    name: ${resolve_default:SimToolRealFBV11,${....experiment}}
+    fb:
+      joint_limit_coefficient: 0.0
+      latent_size: 1024
+      target_frames: 19120128
+      max_seconds: 43200
