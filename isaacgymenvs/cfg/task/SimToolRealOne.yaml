@@ -1,0 +1,12 @@
+defaults:
+  - SimToolRealLSTMAsymmetric
+  - _self_
+
+env:
+  referenceSceneAudit: true
+  handleHeadTypes: [eraser]
+  numAssetsPerType: 1
+  objectScaleNoiseMultiplierRange: [1.0, 1.0]
+  tableResetZRange: 0.0
+  useFixedInitObjectPose: true
+  goalObjectPose: [0.0, 0.0, 0.82, 0.0, 0.0, 1.0, 0.0]

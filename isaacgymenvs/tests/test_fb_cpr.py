@@ -186,3 +186,51 @@ def test_auxiliary_soft_limits_preserve_original_reward_and_have_correct_units(t
     torch.testing.assert_close(penalty, torch.tensor([0., 0., -1.5]))
     torch.testing.assert_close(reward, torch.tensor([-2., -3., -5.5]))
     torch.testing.assert_close(components['velocity'], torch.tensor([-2., -3., -4.]))
+
+
+def test_reference_quality_gate_requires_contiguous_physical_reach(tmp_path):
+    import json
+    import pytest
+    from pathlib import Path
+    agent = make_agent(tmp_path)
+    agent.options.update(reference_min_qualified_environments=2, reference_quality_steps=8,
+                         reference_min_height=.78, reference_max_goal_error=.05,
+                         reference_max_linear_speed=.3, reference_max_angular_speed=3.)
+    agent.vec_env.env.state_list = ['palm_pos', 'keypoints_rel_palm', 'keypoints_rel_goal', 'object_vel']
+    agent.vec_env.env.obs_type_size_dict = dict(palm_pos=3, keypoints_rel_palm=12,
+                                               keypoints_rel_goal=12, object_vel=6)
+    states = torch.zeros(15, 3, 33)
+    states[:, :, 2] = .82
+    valid = torch.ones(15, 3, dtype=torch.bool)
+    agent.experts = ExpertSequences(states, valid)
+    agent.reference_quality_values = agent._reference_physical_values(states)
+    rng = torch.get_rng_state()
+    agent._check_reference_quality()
+    assert torch.equal(rng, torch.get_rng_state())
+    assert torch.equal(agent.experts.states, states)
+    report = json.loads((agent.output_dir / 'reference_quality.rank0.json').read_text())
+    assert report['passed'] and report['qualified_environments'] == 3
+    agent.experts.valid[7] = False
+    with pytest.raises(ValueError, match='physical reachability gate'):
+        agent._check_reference_quality()
+    agent.experts.valid[:] = True
+    for field, value in [(2, .60), (15, .20), (27, .40), (30, 4.)]:
+        original = agent.experts.states[:, :, field].clone()
+        agent.experts.states[:, :, field] = value
+        agent.reference_quality_values = agent._reference_physical_values(agent.experts.states)
+        with pytest.raises(ValueError, match='physical reachability gate'):
+            agent._check_reference_quality()
+        agent.experts.states[:, :, field] = original
+
+
+def test_reference_quality_uses_float32_boundary_measurement(tmp_path):
+    import pytest
+    agent = make_agent(tmp_path)
+    agent.options.update(reference_min_qualified_environments=2, reference_quality_steps=8,
+                         reference_min_height=.78, reference_max_goal_error=.05,
+                         reference_max_linear_speed=.3, reference_max_angular_speed=3.)
+    agent.experts = ExpertSequences(torch.zeros(8, 3, 20).half(), torch.ones(8, 3, dtype=torch.bool))
+    agent.reference_quality_values = torch.tensor([.82, .050001, 0., 0.]).expand(8, 3, 4).clone()
+    assert float(agent.reference_quality_values[0, 0, 1].half()) < .05
+    with pytest.raises(ValueError, match='physical reachability gate'):
+        agent._check_reference_quality()

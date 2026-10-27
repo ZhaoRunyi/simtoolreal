@@ -27,6 +27,7 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 import datetime
+import hashlib
 import io
 import math
 import os
@@ -2274,6 +2275,9 @@ class SimToolReal(VecTask):
         print(f"Robot joint names: {self.joint_names}")
 
         self._after_envs_created()
+        if self.cfg['env'].get('referenceSceneAudit', False):
+            self.object_asset_sha256 = [hashlib.sha256(Path(path).read_bytes()).hexdigest()
+                                        for path in self.object_asset_files]
 
         try:
             # by this point we don't need the temporary folder for procedurally generated assets
@@ -3478,6 +3482,14 @@ class SimToolReal(VecTask):
             self.object_scale_noise_multiplier[env_ids] = torch_rand_float(
                 noise_min, noise_max, (len(env_ids), 3), device=self.device
             )
+
+        if (self.cfg['env'].get('referenceSceneAudit', False) and tensor_reset
+                and reset_buf_idxs is None and len(env_ids) == self.num_envs
+                and not hasattr(self, 'reference_initial_reset')):
+            self.reference_initial_reset = {
+                'object_pose': self.root_state_tensor[self.object_indices, :7].clone(),
+                'scale_noise': self.object_scale_noise_multiplier.clone(),
+            }
 
         if len(env_ids) > 0 and reset_buf_idxs is not None and tensor_reset:
             obj_indices = self.object_indices[env_ids]

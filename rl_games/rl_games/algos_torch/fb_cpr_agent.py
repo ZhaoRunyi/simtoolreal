@@ -7,6 +7,7 @@ from the published SimToolReal PPO teacher, not synthesized from object goals.
 """
 
 import copy
+import hashlib
 import json
 import math
 import time
@@ -143,8 +144,24 @@ class FBcprAgent(FBAgent):
     @torch.no_grad()
     def _prepare_experts(self):
         path = self.output_dir / ('expert.rank' + str(self.global_rank) + '.pt')
+        scene_identity = self._reference_scene_identity()
         if path.exists():
             data = torch.load(path, map_location=self.device)
+            if scene_identity is not None:
+                if data.get('scene_identity') != scene_identity or 'quality_values' not in data:
+                    raise ValueError('PPO reference cache scene identity or physical quality metadata mismatch')
+                expected_shape = (self.options['expert_steps'], min(self.num_actors, self.options['expert_environments']))
+                if data['states'].shape != (*expected_shape, self.state_size) or data['valid'].shape != expected_shape:
+                    raise ValueError('PPO reference cache collection shape mismatch')
+                selected = data.get('selected_environments')
+                if (selected is None or selected.shape != (expected_shape[1],)
+                        or selected.unique().numel() != selected.numel()
+                        or selected.min() < 0 or selected.max() >= self.num_actors):
+                    raise ValueError('PPO reference cache selected environment identity mismatch')
+                for length in (self.options['expert_sequence_length'], self.options['tracking_length']):
+                    if not data['valid'].unfold(0, length, 1).all(-1).any():
+                        raise ValueError('PPO reference cache has no valid reference windows')
+                self.reference_quality_values = data['quality_values']
             self.experts = ExpertSequences(data['states'], data['valid'])
             self.expert_report = data['report']
             self.vec_env.env.reference_reset_bank = data['resets']
@@ -172,6 +189,8 @@ class FBcprAgent(FBAgent):
         observations = {key: value.clone() for key, value in self.vec_env.reset().items()}
         selected = torch.randperm(self.num_actors, device=self.device)[:self.options['expert_environments']]
         states, validity, reset_snapshots = [], [], []
+        quality_values = []
+        initial_scene = None
         previous_done = torch.ones(self.num_actors, dtype=torch.bool, device=self.device)
         episode_return = torch.zeros(self.num_actors, device=self.device)
         return_sum, episodes, successes, lifted = 0., 0, 0., 0.
@@ -184,6 +203,10 @@ class FBcprAgent(FBAgent):
             done = done.bool()
             # Invalid rows include the physical reset step and terminal boundary;
             # all expert slices therefore lie within a single physical episode.
+            if scene_identity is not None:
+                quality_values.append(self._reference_physical_values(observations['states'][selected]).clone())
+                if step == 0:
+                    initial_scene = self._reference_initial_scene()
             states.append(observations['states'][selected].half().clone())
             validity.append((~previous_done & ~done)[selected].clone())
             episode_return += reward.reshape(-1)
@@ -219,6 +242,10 @@ class FBcprAgent(FBAgent):
                        'lifted_fraction': lifted / self.options['expert_steps'],
                        'seconds': time.monotonic() - started},
         }
+        if scene_identity is not None:
+            self.reference_quality_values = torch.stack(quality_values)
+            data.update(scene_identity=scene_identity, initial_scene=initial_scene,
+                        quality_values=self.reference_quality_values, selected_environments=selected)
         temporary = path.with_suffix('.tmp')
         torch.save(data, temporary)
         temporary.replace(path)
@@ -234,7 +261,120 @@ class FBcprAgent(FBAgent):
 
     def train(self):
         self._prepare_experts()
+        self._check_reference_quality()
         return super().train()
+
+    def _reference_scene_identity(self):
+        if not self.options.get('reference_min_qualified_environments', 0):
+            return None
+        environment = self.vec_env.env
+        asset_hashes = environment.object_asset_sha256
+        if len(asset_hashes) != 1:
+            raise ValueError('Single-task reference collection requires exactly one object asset')
+        scales = environment.object_scales
+        if not torch.equal(scales, scales[0].expand_as(scales)):
+            raise ValueError('Single-task reference collection found different object scales')
+        physical_properties = []
+        for scene, actor in zip(environment.envs, environment.objects):
+            bodies = environment.gym.get_actor_rigid_body_properties(scene, actor)
+            shapes = environment.gym.get_actor_rigid_shape_properties(scene, actor)
+            body_values = []
+            for body in bodies:
+                body_values.append([body.mass, body.com.x, body.com.y, body.com.z] +
+                    [getattr(getattr(body.inertia, row), column) for row in 'xyz' for column in 'xyz'])
+            physical_properties.append({'bodies': body_values, 'friction': [shape.friction for shape in shapes]})
+        if any(properties != physical_properties[0] for properties in physical_properties):
+            raise ValueError('Single-task reference collection found different object physics')
+        teacher_path = Path(self.options['teacher_path']) / 'model.pth'
+        digest = hashlib.sha256()
+        with teacher_path.open('rb') as stream:
+            for chunk in iter(lambda: stream.read(8 * 1024 * 1024), b''):
+                digest.update(chunk)
+        return {'asset_sha256': asset_hashes, 'scale': scales[0].cpu().tolist(),
+                'physics': physical_properties[0], 'environment_count': len(environment.envs),
+                'settings': copy.deepcopy(environment.cfg['env']),
+                'teacher_sha256': digest.hexdigest(), 'state_list': list(environment.state_list),
+                'state_size': self.state_size, 'rank': self.global_rank, 'seed': torch.initial_seed(),
+                'collection': {name: self.options[name] for name in
+                    ('expert_steps', 'expert_environments', 'reference_stride')}}
+
+    def _reference_initial_scene(self):
+        environment = self.vec_env.env
+        objects = environment.root_state_tensor[environment.object_indices, :7]
+        goals = environment.goal_states[:, :7]
+        expected_goal = goals.new_tensor(environment.cfg['env']['goalObjectPose'])
+        if not torch.allclose(goals, expected_goal.expand_as(goals), atol=1e-6, rtol=0):
+            raise ValueError('Single-task physical reset produced inconsistent goals')
+        if not torch.equal(environment.object_scale_noise_multiplier,
+                           torch.ones_like(environment.object_scale_noise_multiplier)):
+            raise ValueError('Single-task physical reset changed object scale')
+        reset = environment.reference_initial_reset
+        reset_pose = reset['object_pose']
+        if not torch.allclose(reset_pose, reset_pose[0].expand_as(reset_pose), atol=1e-6, rtol=0):
+            raise ValueError('Single-task reset commands have different initial object poses')
+        if not torch.equal(reset['scale_noise'], torch.ones_like(reset['scale_noise'])):
+            raise ValueError('Single-task reset command changed object scale')
+        report = {'reset_command_object_pose': reset_pose[0].cpu().tolist(),
+                  'object_pose': objects[0].cpu().tolist(), 'goal_pose': goals[0].cpu().tolist(),
+                  'object_pose_max_difference': float((objects - objects[0]).abs().max()),
+                  'scale_noise_min': float(environment.object_scale_noise_multiplier.min()),
+                  'scale_noise_max': float(environment.object_scale_noise_multiplier.max()),
+                  'after_first_physics_step': True}
+        path = self.output_dir / ('reference_scene.rank' + str(self.global_rank) + '.json')
+        path.write_text(json.dumps(report, indent=2))
+        return report
+
+    def _reference_physical_values(self, states):
+        environment = self.vec_env.env
+        slices = {}
+        offset = 0
+        for name in environment.state_list:
+            size = environment.obs_type_size_dict[name]
+            slices[name] = slice(offset, offset + size)
+            offset += size
+        if states.shape[-1] != offset:
+            raise ValueError('Reference state schema does not match the current environment')
+        keypoints = states[..., slices['keypoints_rel_palm']].reshape(*states.shape[:-1], 4, 3)
+        center = states[..., slices['palm_pos']] + keypoints.mean(-2)
+        goal_error = states[..., slices['keypoints_rel_goal']].reshape(*states.shape[:-1], 4, 3).norm(dim=-1).max(-1).values
+        velocity = states[..., slices['object_vel']]
+        return torch.stack((center[..., 2], goal_error, velocity[..., :3].norm(dim=-1),
+                            velocity[..., 3:].norm(dim=-1)), dim=-1)
+
+    @torch.no_grad()
+    def _check_reference_quality(self):
+        minimum = self.options.get('reference_min_qualified_environments', 0)
+        if not minimum:
+            return
+        values = self.reference_quality_values
+        if values.shape != (*self.experts.valid.shape, 4) or values.dtype != torch.float32:
+            raise ValueError('Reference qualification requires aligned float32 physical measurements')
+        qualified = self.experts.valid.bool() & torch.isfinite(values).all(-1)
+        qualified &= values[..., 0] >= self.options['reference_min_height']
+        qualified &= values[..., 1] <= self.options['reference_max_goal_error']
+        qualified &= values[..., 2] <= self.options['reference_max_linear_speed']
+        qualified &= values[..., 3] <= self.options['reference_max_angular_speed']
+        length = self.options['reference_quality_steps']
+        windows = qualified.unfold(0, length, 1).all(-1)
+        counts = windows.sum(0)
+        passed = (counts > 0).sum() >= minimum
+        report = {
+            'rank': self.global_rank, 'qualified_environments': int((counts > 0).sum()),
+            'required_environments': minimum, 'window_steps': length,
+            'qualified_windows_per_environment': counts.cpu().tolist(),
+            'minimum_height': self.options['reference_min_height'],
+            'maximum_goal_error': self.options['reference_max_goal_error'],
+            'maximum_linear_speed': self.options['reference_max_linear_speed'],
+            'maximum_angular_speed': self.options['reference_max_angular_speed'],
+            'measurement_dtype': str(values.dtype),
+            'reference_rows_filtered_for_training': False, 'passed': bool(passed),
+        }
+        (self.output_dir / ('reference_quality.rank' + str(self.global_rank) + '.json')).write_text(json.dumps(report, indent=2))
+        decision = torch.tensor(int(passed), device=self.device)
+        if self.world_size > 1:
+            distributed.all_reduce(decision, op=distributed.ReduceOp.MIN)
+        if not decision.item():
+            raise ValueError('PPO reference cache failed the registered physical reachability gate; cache retained')
 
     @torch.no_grad()
     def _sample_commands(self, count):
