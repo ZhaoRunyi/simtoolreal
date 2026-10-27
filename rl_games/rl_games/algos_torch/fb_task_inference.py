@@ -54,7 +54,8 @@ def select_phase_commands(commands, lifted, mode):
 
 @torch.no_grad()
 def infer_command_bank(backward, normalizer, paths, frame, optimizer_step, device,
-                       method='mean', temperature=0.1, batch_size=2048, world_size=4):
+                       method='mean', temperature=0.1, batch_size=2048, world_size=4,
+                       reward_definition='original', tracking_temperature=0.05):
     """Encode frozen, uniform valid-replay samples with the matching checkpoint.
 
     The pool stores next states and their observed transition rewards. Original
@@ -92,6 +93,18 @@ def infer_command_bank(backward, normalizer, paths, frame, optimizer_step, devic
     support = torch.stack((components[:, :4].clamp_min(0).sum(-1),
                            components[:, [4, 7]].clamp_min(0).sum(-1),
                            components[:, [0, 2, 3, 4, 7]].clamp_min(0).sum(-1)), -1)
+    if reward_definition == 'object_tracking':
+        if states.shape[1] != 162 or tracking_temperature <= 0:
+            raise ValueError('Object tracking requires the SimToolReal 162-state schema and positive temperature')
+        # SimToolReal asymmetric state: four goal-minus-object keypoint vectors.
+        distance = states[:, 137:149].reshape(-1, 4, 3).norm(dim=-1).amax(-1)
+        tracking_reward = torch.exp(-distance / tracking_temperature)
+        # Keep the bank's three-slot loading contract; all slots name the same
+        # object-only criterion, with no grasp, bonus or velocity reward added.
+        rewards = tracking_reward[:, None].expand(-1, len(stage_names))
+        support = rewards
+    elif reward_definition != 'original':
+        raise ValueError('Unknown reward definition: ' + reward_definition)
     if (support.sum(0) <= 0).any():
         missing = [stage_names[i] for i in range(3) if support[:, i].sum() <= 0]
         raise ValueError('Replay has no positive task evidence for phases: ' + str(missing))
@@ -125,7 +138,11 @@ def infer_command_bank(backward, normalizer, paths, frame, optimizer_step, devic
             'stage_names': list(stage_names), 'frame': frame, 'optimizer_step': optimizer_step,
             'method': method, 'temperature': temperature, 'sample_count': len(states),
             'sources': sources, 'statistics': statistics,
-            'reward_definition': 'original scaled transition components; phase-specific task terms plus original action/velocity penalties'}
+            'reward_kind': reward_definition,
+            'tracking_temperature': tracking_temperature if reward_definition == 'object_tracking' else None,
+            'reward_definition': ('exp(-max_four_keypoint_distance / tracking_temperature); identical bank slots'
+                                  if reward_definition == 'object_tracking' else
+                                  'original scaled transition components; phase-specific task terms plus original action/velocity penalties')}
 
 
 def main():
@@ -138,6 +155,8 @@ def main():
     parser.add_argument('--method', choices=('mean', 'reward_weighted'), default='mean')
     parser.add_argument('--temperature', type=float, default=.1)
     parser.add_argument('--batch-size', type=int, default=2048)
+    parser.add_argument('--reward-definition', choices=('original', 'object_tracking'), default='original')
+    parser.add_argument('--tracking-temperature', type=float, default=.05)
     args = parser.parse_args()
     checkpoint = torch.load(args.checkpoint, map_location='cpu')
     options = checkpoint['options']
@@ -152,7 +171,7 @@ def main():
     del checkpoint
     bank = infer_command_bank(backward, normalizer, sorted(glob.glob(args.pool_glob)),
                               frame, step, args.device, args.method, args.temperature,
-                              args.batch_size, world_size)
+                              args.batch_size, world_size, args.reward_definition, args.tracking_temperature)
     bank['checkpoint_sha256'] = checkpoint_digest(args.checkpoint)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     torch.save(bank, args.output)
