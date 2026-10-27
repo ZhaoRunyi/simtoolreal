@@ -127,6 +127,7 @@ class CPRModel(nn.Module):
     def __init__(self, observation_size, state_size, action_size, config, network):
         super().__init__()
         latent_size = config['latent_size']
+        self.state_size = state_size
         self.actor = HistoryActor(observation_size, action_size, latent_size, config)
         self.backward_state_size = config.get('backward_state_size', state_size)
         self.backward = BackwardMap(self.backward_state_size, latent_size, config.get('backward_state_indices'))
@@ -143,8 +144,10 @@ class CPRModel(nn.Module):
         self.style_maps = nn.ModuleList([
             ResidualMap(*arguments, 1, width, depth) for _ in range(2)
         ])
+        discriminator_indices = config.get('discriminator_state_indices', self.backward.state_indices.tolist())
+        self.register_buffer('discriminator_state_indices', torch.tensor(discriminator_indices, dtype=torch.long), persistent=False)
         self.discriminator = nn.Sequential(
-            nn.Linear(self.backward_state_size + latent_size, 1024), nn.LayerNorm(1024), nn.Tanh(),
+            nn.Linear(len(discriminator_indices) + latent_size, 1024), nn.LayerNorm(1024), nn.Tanh(),
             nn.Linear(1024, 1024), nn.ReLU(),
             nn.Linear(1024, 1024), nn.ReLU(), nn.Linear(1024, 1),
         )
@@ -167,7 +170,11 @@ class CPRModel(nn.Module):
         return torch.stack([model(state, action, command).squeeze(-1) for model in self.style_maps])
 
     def discriminate(self, state, command):
-        return self.discriminator(torch.cat((command, self.backward.select_state(state)), dim=-1)).squeeze(-1)
+        selected = state.index_select(-1, self.discriminator_state_indices)
+        return self.discriminator(torch.cat((command, selected), dim=-1)).squeeze(-1)
+
+    def critic_state(self, state, history):
+        return torch.cat((state[..., :self.state_size], history), dim=-1)
 
     @torch.no_grad()
     def actor_prompt(self, state, command):
@@ -198,6 +205,39 @@ class BatchNormalizer(nn.Module):
                 self.running_mean.lerp_(mean, self.momentum)
                 self.running_var.lerp_(variance, self.momentum)
         return (inputs - self.running_mean) / (self.running_var + 1e-5).sqrt()
+
+
+class ObjectGoalNormalizer(BatchNormalizer):
+    """Append world-frame object/goal geometry before updating BN statistics.
+
+    The original 162 normalized fields remain available to the critics and D.
+    B selects only the appended 40 fields. Replay and checkpoint schema still
+    describe the environment's unmodified 162-dimensional raw state.
+    """
+    def __init__(self, state_size):
+        if state_size != 162:
+            raise ValueError('Object/goal features require the SimToolReal 162-field state')
+        super().__init__(state_size + 40)
+
+    @staticmethod
+    def features(state):
+        if state.shape[-1] != 162:
+            raise ValueError('Object/goal features must be constructed from raw state')
+        relative_points = state[..., 125:137].reshape(*state.shape[:-1], 4, 3)
+        object_points = relative_points + state[..., 87:90].unsqueeze(-2)
+        goal_points = object_points - state[..., 137:149].reshape(*state.shape[:-1], 4, 3)
+        return torch.cat((object_points.mean(-2), state[..., 100:110],
+                          object_points.flatten(-2), goal_points.flatten(-2),
+                          state[..., 149:152]), dim=-1)
+
+    def forward(self, inputs):
+        return super().forward(torch.cat((inputs, self.features(inputs)), dim=-1))
+
+
+def make_state_normalizer(state_size, options):
+    if options.get('object_goal_features', False):
+        return ObjectGoalNormalizer(state_size)
+    return BatchNormalizer(state_size)
 
 
 class RewardNormalizer(nn.Module):

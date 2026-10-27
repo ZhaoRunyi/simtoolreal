@@ -1,0 +1,15 @@
+defaults:
+  - SimToolRealFBV4
+  - _self_
+
+params:
+  config:
+    name: ${resolve_default:SimToolRealFBV10,${....experiment}}
+    fb:
+      joint_limit_coefficient: 0.0
+      target_frames: 19120128
+      max_seconds: 21600
+      object_goal_features: true
+      backward_state_size: 40
+      backward_state_indices: ${eval:"list(range(162, 202))"}
+      discriminator_state_indices: ${eval:"list(range(152)) + [158]"}

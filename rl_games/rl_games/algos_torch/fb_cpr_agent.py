@@ -25,6 +25,7 @@ from rl_games.algos_torch.fb_agent import FBAgent
 from rl_games.algos_torch.fb_networks import project_task, successor_loss
 from rl_games.algos_torch.fb_cpr_networks import (
     BatchNormalizer, CPRModel, ExpertSequences, RewardNormalizer, TransitionReplay, TemporalReplay,
+    make_state_normalizer,
 )
 from rl_games.algos_torch.fb_task_inference import (
     reward_components, infer_command_bank, checkpoint_digest,
@@ -44,7 +45,7 @@ class FBcprAgent(FBAgent):
                 distributed.broadcast(parameter.data, 0)
         self.target.load_state_dict(self.model.state_dict())
         self.observation_normalizer = BatchNormalizer(self.observation_size).to(self.device).eval()
-        self.state_normalizer = BatchNormalizer(self.state_size).to(self.device).eval()
+        self.state_normalizer = make_state_normalizer(self.state_size, self.options).to(self.device).eval()
         self.action_normalizer = BatchNormalizer(self.action_size).to(self.device).eval()
         self.reward_normalizer = RewardNormalizer().to(self.device)
         self.style_optimizer = torch.optim.Adam(self.model.style_maps.parameters(), lr=self.config['learning_rate'])
@@ -286,7 +287,7 @@ class FBcprAgent(FBAgent):
 
     def _actor_objective(self, state, history, command):
         action = self._sample_action(history, state, command, self.options['target_noise_clip'])
-        critic_state = torch.cat((state, history), -1)
+        critic_state = self.model.critic_state(state, history)
         q_fb = (self.model(critic_state, action, command) * command).sum(-1).min(0).values
         q_style = self.model.style(critic_state, action, command).min(0).values
         q_auxiliary = self.model.auxiliary(critic_state, action, command).min(0).values
@@ -493,8 +494,8 @@ class FBcprAgent(FBAgent):
         state, next_state = self.state_normalizer(batch['state']), self.state_normalizer(batch['next_state'])
         history = self._history_input(batch['history'].reshape(-1, self.options['history_steps'], self.observation_size), batch['previous_action'])
         next_history = self._history_input(batch['next_history'].reshape(-1, self.options['history_steps'], self.observation_size), batch['action'])
-        critic_state = torch.cat((state, history), -1)
-        next_critic_state = torch.cat((next_state, next_history), -1)
+        critic_state = self.model.critic_state(state, history)
+        next_critic_state = self.model.critic_state(next_state, next_history)
         count, length = len(state), self.options['expert_sequence_length']
         with torch.no_grad():
             expert_sequence = self.experts.sample(count // length, length + 1)

@@ -146,7 +146,7 @@ def infer_command_bank(backward, normalizer, paths, frame, optimizer_step, devic
 
 
 def main():
-    from rl_games.algos_torch.fb_cpr_networks import BackwardMap, BatchNormalizer
+    from rl_games.algos_torch.fb_cpr_networks import BackwardMap, make_state_normalizer
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--checkpoint', type=Path, required=True)
     parser.add_argument('--pool-glob', required=True)
@@ -160,7 +160,7 @@ def main():
     args = parser.parse_args()
     checkpoint = torch.load(args.checkpoint, map_location='cpu')
     options = checkpoint['options']
-    normalizer = BatchNormalizer(checkpoint['schema']['state']).to(args.device)
+    normalizer = make_state_normalizer(checkpoint['schema']['state'], options).to(args.device)
     normalizer.load_state_dict(checkpoint['state_normalizer'])
     backward = BackwardMap(options['backward_state_size'], options['latent_size'],
                            options.get('backward_state_indices')).to(args.device)

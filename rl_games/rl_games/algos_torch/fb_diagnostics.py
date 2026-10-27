@@ -10,7 +10,9 @@ from pathlib import Path
 
 import torch
 
-from rl_games.algos_torch.fb_cpr_networks import CPRModel, BatchNormalizer, TransitionReplay, TemporalReplay
+from rl_games.algos_torch.fb_cpr_networks import (
+    CPRModel, BatchNormalizer, TransitionReplay, TemporalReplay, make_state_normalizer,
+)
 from rl_games.algos_torch.fb_networks import project_task, successor_loss
 from rl_games.algos_torch.fb_task_inference import checkpoint_digest
 
@@ -70,7 +72,8 @@ def main():
     target.load_state_dict(checkpoint['target'])
     normalizers = {}
     for name, dimension in [('state', schema['state']), ('observation', schema['observation']), ('action', schema['action'])]:
-        normalizer = BatchNormalizer(dimension).to(args.device).eval()
+        normalizer = make_state_normalizer(dimension, options) if name == 'state' else BatchNormalizer(dimension)
+        normalizer = normalizer.to(args.device).eval()
         normalizer.load_state_dict(checkpoint[name + '_normalizer'])
         normalizers[name] = normalizer
     frame, optimizer_step = checkpoint['frame'], checkpoint['optimizer_step']
@@ -118,8 +121,8 @@ def main():
             history = torch.cat((history, normalizers['action'](data['previous_action'])), -1)
             next_history = normalizers['observation'](data['next_history'].reshape(-1, schema['observation'])).reshape(len(state), -1)
             next_history = torch.cat((next_history, normalizers['action'](data['action'])), -1)
-            critic_state = torch.cat((state, history), -1)
-            next_critic = torch.cat((next_state, next_history), -1)
+            critic_state = model.critic_state(state, history)
+            next_critic = model.critic_state(next_state, next_history)
             features = model.backward(next_state)
             current_features = model.backward(state)
             commands = {'behavior': data['command'], 'random': project_task(torch.randn_like(features)),
