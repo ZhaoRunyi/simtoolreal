@@ -552,6 +552,8 @@ class FBAgent:
                     distributed.broadcast(decision, 0)
                 if self.epoch_num % self.config["save_frequency"] == 0 or decision.item():
                     self.save(self.nn_dir / "last.pt", replay=bool(decision.item()))
+                if self.frame in self.options.get("snapshot_frames", ()):
+                    self.save(self.nn_dir / ("frame_" + str(self.frame) + ".pt"), replay=False)
                 if self.global_rank == 0:
                     self._status("running", elapsed_seconds=elapsed, projected_remaining_hours=remaining / 3600, **last_metrics)
                 if decision.item():
