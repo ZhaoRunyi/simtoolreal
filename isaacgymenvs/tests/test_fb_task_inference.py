@@ -147,3 +147,52 @@ def test_command_reward_logging_uses_counts_not_average_of_means(tmp_path):
                          'command_reward_sum/expert_mean/total_reward': 8.})
     assert result['command_reward_step/random/total_reward'] == 1.5
     assert result['command_reward_step/expert_mean/total_reward'] == 4.
+
+
+def test_object_tracking_cli_uses_own_checkpoint_and_four_pools(tmp_path, monkeypatch):
+    import sys
+    from rl_games.algos_torch import fb_task_inference
+    from rl_games.algos_torch.fb_cpr_networks import BackwardMap, BatchNormalizer
+    torch.manual_seed(37)
+    backward = BackwardMap(153, 4, list(range(152)) + [158])
+    normalizer = BatchNormalizer(162)
+    checkpoint = tmp_path / 'last.pt'
+    torch.save({'options': {'backward_state_size': 153, 'latent_size': 4,
+                           'backward_state_indices': list(range(152)) + [158]},
+                'model': {'backward.' + key: value for key, value in backward.state_dict().items()},
+                'state_normalizer': normalizer.state_dict(), 'schema': {'state': 162},
+                'frame': 19120128, 'optimizer_step': 11440, 'training_world_size': 4}, checkpoint)
+    states = []
+    paths = []
+    for rank in range(4):
+        state = torch.randn(8, 162) * .02
+        state[:, 137:149] *= rank + 1
+        states.append(state)
+        path = tmp_path / ('last.rank' + str(rank) + '.inference.pt')
+        paths.append(path)
+        torch.save({'next_state': state, 'reward_components': torch.ones(8, 10),
+                    'schema_version': 1, 'reward_names': reward_components,
+                    'rank': rank, 'world_size': 4, 'frame': 19120128, 'optimizer_step': 11440,
+                    'sample_count': 8, 'population': 100}, path)
+    backward.eval()
+    normalizer.eval()
+    all_states = torch.cat(states)
+    features = backward(normalizer(all_states))
+    distance = all_states[:, 137:149].reshape(-1, 4, 3).norm(dim=-1).amax(-1)
+    expected = project_task((torch.exp(-distance / .05)[:, None] * features).mean(0, keepdim=True))
+    for kind in ('original', 'object_tracking'):
+        output = tmp_path / (kind + '.pt')
+        monkeypatch.setattr(sys, 'argv', ['inference', '--checkpoint', str(checkpoint),
+            '--pool-glob', str(tmp_path / '*.inference.pt'), '--output', str(output),
+            '--reward-definition', kind, '--batch-size', '7'])
+        fb_task_inference.main()
+        bank = torch.load(output)
+        assert bank['reward_kind'] == kind
+        assert bank['sample_count'] == 32
+        assert [row['rank'] for row in bank['sources']] == list(range(4))
+        assert bank['checkpoint_sha256'] == fb_task_inference.checkpoint_digest(checkpoint)
+        if kind == 'object_tracking':
+            torch.testing.assert_close(bank['commands'], expected.expand(3, -1), atol=2e-6, rtol=2e-6)
+        else:
+            original = infer_command_bank(backward, normalizer, paths, 19120128, 11440, 'cpu', batch_size=7)
+            torch.testing.assert_close(bank['commands'], original['commands'], atol=0, rtol=0)
