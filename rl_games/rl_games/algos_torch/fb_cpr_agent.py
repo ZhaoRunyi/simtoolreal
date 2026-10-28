@@ -706,6 +706,8 @@ class FBcprAgent(FBAgent):
 
 
 class FBcprPlayer(FBcprAgent):
+    requires_training_recovery = False
+
     def __init__(self, params):
         super().__init__('fb_cpr_eval', params)
 

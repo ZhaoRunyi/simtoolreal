@@ -22,6 +22,82 @@ def prepare_saved_state(agent):
         setattr(agent, name, None)
 
 
+@pytest.mark.parametrize('cpr', [False, True])
+def test_actual_player_restores_four_rank_model_without_training_replay(tmp_path, cpr):
+    from rl_games.algos_torch.fb_agent import FBAgent, FBPlayer
+    from rl_games.algos_torch.fb_cpr_agent import FBcprPlayer
+
+    agent = make_agent(tmp_path / 'training')
+    if not cpr:
+        agent.options.update(critic_units=[16, 8], backward_units=[8, 8])
+        agent.params['network'] = {'rnn': {'units': 8}, 'mlp': {'units': [16, 8]}}
+        agent = FBAgent('test', agent.params)
+    agent.options['full_recovery_interval'] = 4096
+    agent.vec_env.env.cfg = {'env': {}}  # Real task config has no global test flag.
+    prepare_saved_state(agent)
+    agent.world_size = 4
+    agent.frame = 19120128
+    agent.optimizer_step = 11440
+    path = tmp_path / 'last.pt'
+    agent._save_files(path, replay=False, identity='four-rank-model')
+    # The evaluation process is one rank, regardless of the learner's world size.
+    player = (FBcprPlayer if cpr else FBPlayer)(agent.params)
+    assert player.world_size == 1
+    manifest = path.with_suffix('.complete.json')
+    manifest.write_text(json.dumps({'world_size': 4}))
+    for has_manifest in [True, False]:
+        if not has_manifest:
+            manifest.unlink()
+        player.restore(path)
+        assert player.frame == agent.frame and player.optimizer_step == agent.optimizer_step
+        for name in ['model', 'target', 'observation_normalizer', 'state_normalizer',
+                     'actor_optimizer', 'representation_optimizer', 'auxiliary_optimizer']:
+            equal_nested(getattr(player, name).state_dict(), getattr(agent, name).state_dict())
+        if cpr:
+            assert player.training_world_size == 4
+            equal_nested(player.reward_normalizer.state_dict(), agent.reward_normalizer.state_dict())
+    checkpoint = torch.load(path, map_location='cpu', weights_only=False)
+    checkpoint['schema']['state'] += 1
+    torch.save(checkpoint, path)
+    with pytest.raises(ValueError, match='schemas differ'):
+        player.restore(path)
+
+
+@pytest.mark.parametrize('defect', ['world_size', 'missing_rank', 'checksum', 'model_identity'])
+def test_learner_restore_still_enforces_recovery_with_task_test_flag(tmp_path, defect):
+    agent = make_agent(tmp_path / 'training')
+    agent.options['full_recovery_interval'] = 4096
+    agent.vec_env.env.cfg = {'test': True}  # A task field must never disable learner checks.
+    prepare_saved_state(agent)
+    path = tmp_path / 'last.pt'
+    agent.save(path, replay=True)
+    agent.restore(path)
+    manifest_path = path.with_suffix('.complete.json')
+    manifest = json.loads(manifest_path.read_text())
+    expected = RuntimeError
+    if defect == 'world_size':
+        manifest['world_size'] = 4
+        message = 'world size differs'
+    elif defect == 'missing_rank':
+        manifest['files'] = [row for row in manifest['files'] if row['name'] == path.name]
+        message = 'does not contain all ranks'
+    elif defect == 'checksum':
+        shard = path.with_name('last.rank0.replay.pt')
+        data = bytearray(shard.read_bytes())
+        data[-1] ^= 1
+        shard.write_bytes(data)
+        message = 'checksum mismatch'
+    else:
+        manifest['identity'] = 'different-publication'
+        message = 'Model and recovery manifest identities differ'
+        expected = ValueError
+    manifest_path.write_text(json.dumps(manifest))
+    before = copy.deepcopy(agent.model.state_dict())
+    with pytest.raises(expected, match=message):
+        agent.restore(path)
+    equal_nested(before, agent.model.state_dict())
+
+
 def recovery_worker(rank, root, rendezvous):
     root = Path(root)
     # Construct on CPU before init: production __init__ correctly chooses CUDA for DDP.

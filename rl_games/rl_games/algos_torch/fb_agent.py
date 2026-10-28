@@ -25,6 +25,7 @@ from rl_games.algos_torch.running_mean_std import RunningMeanStd
 
 class FBAgent:
     model_class = FBModel
+    requires_training_recovery = True
 
     def __init__(self, base_name, params):
         self.params = params
@@ -559,7 +560,7 @@ class FBAgent:
 
     def restore(self, filename):
         manifest = None
-        if self.options.get("full_recovery_interval", 0) > 0 and not getattr(self.vec_env.env, "cfg", {}).get("test", False):
+        if self.requires_training_recovery and self.options.get("full_recovery_interval", 0) > 0:
             report = {}
             try:
                 manifest = self._validate_recovery(filename)
@@ -693,6 +694,8 @@ class FBAgent:
 
 
 class FBPlayer(FBAgent):
+    requires_training_recovery = False
+
     def __init__(self, params):
         super().__init__("fb_eval", params)
 
