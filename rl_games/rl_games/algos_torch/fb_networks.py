@@ -12,6 +12,54 @@ def project_task(task):
     return math.sqrt(task.shape[-1]) * torch.nn.functional.normalize(task, dim=-1)
 
 
+def scalar_successor_loss(forward, backward, target_forward, command, discount, valid,
+                          spectrum=False):
+    """FB scalar Bellman loss, with a detached batch-coordinate reward.
+
+    Follows BFM-Zero's optional Q loss (mean target, half squared error per
+    head). The uncentered second moment and solve use FP64, without a ridge,
+    pseudoinverse, reward clipping, or a fallback on a failed solve.
+    """
+    selected = valid.reshape(-1).bool()
+    if int(selected.sum()) < 2:
+        raise ValueError('Scalar FB loss requires at least two valid transitions')
+    with torch.no_grad():
+        features = backward.detach()[selected].double()
+        tasks = command.detach()[selected]
+        covariance = features.T @ features / len(features)
+        coordinates = torch.linalg.solve(covariance, features.T).T
+        implicit_reward = (coordinates * tasks.double()).sum(-1).float()
+        next_value = (target_forward.detach()[:, selected].float() * tasks).sum(-1).mean(0)
+        target = implicit_reward + discount.detach().reshape(-1)[selected] * next_value
+        residual = coordinates @ covariance - features
+        solve_error = residual.norm() / features.norm().clamp_min(1e-30)
+    values = (forward[:, selected].float() * tasks).sum(-1)
+    loss = 0.5 * (values - target).square().mean(1).sum()
+    metrics = {
+        'loss/q_td': loss.detach(),
+        'q_td/reward_mean': implicit_reward.mean(),
+        'q_td/reward_std': implicit_reward.std(unbiased=False),
+        'q_td/reward_absmax': implicit_reward.abs().max(),
+        'q_td/value_mean': values.detach().mean(),
+        'q_td/target_mean': target.mean(),
+        'q_td/residual_rmse': (values.detach() - target).square().mean().sqrt(),
+        'q_td/solve_relative_residual': solve_error.float(),
+    }
+    if spectrum:
+        with torch.no_grad():
+            eigenvalues = torch.linalg.eigvalsh(covariance)
+            probabilities = eigenvalues.clamp_min(0) / eigenvalues.clamp_min(0).sum().clamp_min(1e-30)
+            metrics.update({
+                'q_td/cov_min_eigenvalue': eigenvalues[0].float(),
+                'q_td/cov_max_eigenvalue': eigenvalues[-1].float(),
+                'q_td/cov_condition': (eigenvalues[-1] / eigenvalues[0]).float(),
+                'q_td/cov_effective_rank': (-(probabilities * probabilities.clamp_min(1e-30).log()).sum()).exp().float(),
+            })
+    if not all(bool(torch.isfinite(value).all()) for value in metrics.values()):
+        raise FloatingPointError('Non-finite scalar FB loss or coordinate solve')
+    return loss, metrics
+
+
 def successor_loss(forward, backward, target_forward, target_backward, discount, valid):
     """Exact off-diagonal squared FB loss, without materializing an N x N matrix.
 

@@ -1,0 +1,13 @@
+defaults:
+  - SimToolRealFBV4
+  - _self_
+
+params:
+  config:
+    name: ${resolve_default:SimToolRealFBV12,${....experiment}}
+    fb:
+      joint_limit_coefficient: 0.0
+      q_loss_coefficient: 0.1
+      full_recovery_interval: 4096
+      target_frames: 19120128
+      max_seconds: 21600

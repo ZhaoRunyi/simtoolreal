@@ -5,6 +5,7 @@ Only the learner, replay and task-conditioned networks differ from PPO/SAPG.
 """
 
 import copy
+import hashlib
 import json
 import os
 import random
@@ -433,11 +434,12 @@ class FBAgent:
     def _restore_extra(self, checkpoint):
         pass
 
-    def save(self, filename, replay=False):
+    def _save_files(self, filename, replay=False, identity=None):
         filename = Path(filename)
         if self.global_rank == 0:
             checkpoint = {
                 **self._checkpoint_extra(),
+                "recovery_identity": identity,
                 "model": self.model.state_dict(), "target": self.target.state_dict(),
                 "observation_normalizer": self.observation_normalizer.state_dict(),
                 "state_normalizer": self.state_normalizer.state_dict(),
@@ -457,20 +459,118 @@ class FBAgent:
             shard = filename.with_name(filename.stem + ".rank" + str(self.global_rank) + ".replay.pt")
             torch.save({
                 "frame": self.frame, "optimizer_step": self.optimizer_step, "epoch": self.epoch_num,
+                "recovery_identity": identity, "rank": self.global_rank, "world_size": self.world_size,
+                "rank_state": {**self._checkpoint_extra(),
+                               "observation_normalizer": self.observation_normalizer.state_dict(),
+                               "state_normalizer": self.state_normalizer.state_dict()},
                 "replay": self.replay.state_dict(), "rng": torch.get_rng_state(),
-                "cuda_rng": torch.cuda.get_rng_state(self.device), "numpy_rng": np.random.get_state(),
+                "cuda_rng": torch.cuda.get_rng_state(self.device) if self.device.type == "cuda" else None, "numpy_rng": np.random.get_state(),
                 "python_rng": random.getstate(), "environment": self.vec_env.get_env_state(),
                 "observations": self.observations, "actor_state": self.actor_state,
                 "rollout_command": self.rollout_command, "command_age": self.command_age,
                 "reset_before": self.reset_before, "episode_reward": self.episode_reward,
                 "previous_block": self.previous_block, "previous_initial_state": self.previous_initial_state,
             }, shard)
+
+    @staticmethod
+    def _file_identity(path):
+        digest = hashlib.sha256()
+        with path.open("rb") as stream:
+            for block in iter(lambda: stream.read(8 * 1024 * 1024), b""):
+                digest.update(block)
+        return {"name": path.name, "size": path.stat().st_size, "sha256": digest.hexdigest()}
+
+    def _gather_save_reports(self, report):
+        reports = [None] * self.world_size
         if self.world_size > 1:
-            distributed.barrier()
+            distributed.all_gather_object(reports, report)
+        else:
+            reports[0] = report
+        if any(item.get("error") for item in reports):
+            raise RuntimeError("Checkpoint publication failed: " + repr(reports))
+        return reports
+
+    def save(self, filename, replay=False):
+        filename = Path(filename)
+        verified = self.options.get("full_recovery_interval", 0) > 0
+        manifest_path = filename.with_suffix(".complete.json")
+        identity = None
+        if verified:
+            report = {}
+            try:
+                if self.global_rank == 0:
+                    # Recovery filenames are immutable, including abandoned partial writes.
+                    if filename.stem.startswith("recovery-") and any(filename.parent.glob(filename.stem + ".*")):
+                        raise FileExistsError("Recovery point already exists: " + str(filename))
+                    manifest_path.unlink(missing_ok=True)
+                    identity = os.urandom(16).hex()
+            except Exception as error:
+                report["error"] = repr(error)
+            self._gather_save_reports(report)
+            identities = [identity]
+            if self.world_size > 1:
+                distributed.broadcast_object_list(identities, src=0)
+            identity = identities[0]
+        report = {"rank": self.global_rank, "identity": identity, "frame": self.frame,
+                  "epoch": self.epoch_num, "optimizer_step": self.optimizer_step, "files": []}
+        try:
+            self._save_files(filename, replay, identity)
+            if verified and replay:
+                paths = [filename] if self.global_rank == 0 else []
+                paths.append(filename.with_name(filename.stem + ".rank" + str(self.global_rank) + ".replay.pt"))
+                report["files"] = [self._file_identity(path) for path in paths]
+        except Exception as error:
+            report["error"] = repr(error)
+        reports = self._gather_save_reports(report)
+        publication = {}
+        if verified and replay and self.global_rank == 0:
+            try:
+                keys = ("identity", "frame", "epoch", "optimizer_step")
+                if any(any(item[key] != reports[0][key] for key in keys) for item in reports):
+                    raise ValueError("Recovery rank identities or counters disagree")
+                manifest = {"schema_version": 1, "world_size": self.world_size,
+                            **{key: reports[0][key] for key in keys},
+                            "files": [entry for item in reports for entry in item["files"]]}
+                temporary = manifest_path.with_suffix(".tmp")
+                temporary.write_text(json.dumps(manifest, indent=2))
+                temporary.replace(manifest_path)
+            except Exception as error:
+                publication["error"] = repr(error)
+        self._gather_save_reports(publication)
         self.last_checkpoint = filename
 
+    def _validate_recovery(self, filename):
+        filename = Path(filename)
+        manifest = json.loads(filename.with_suffix(".complete.json").read_text())
+        if manifest["world_size"] != self.world_size:
+            raise ValueError("Recovery world size differs")
+        expected = {filename.name} | {filename.stem + ".rank" + str(rank) + ".replay.pt"
+                                       for rank in range(self.world_size)}
+        if {entry["name"] for entry in manifest["files"]} != expected:
+            raise ValueError("Recovery manifest does not contain all ranks")
+        local = {filename.name, filename.stem + ".rank" + str(self.global_rank) + ".replay.pt"}
+        for entry in manifest["files"]:
+            path = filename.parent / entry["name"]
+            if not path.is_file() or path.stat().st_size != entry["size"]:
+                raise ValueError("Recovery artifact missing or changed: " + str(path))
+            if entry["name"] in local and self._file_identity(path) != entry:
+                raise ValueError("Recovery checksum mismatch: " + str(path))
+        return manifest
+
     def restore(self, filename):
+        manifest = None
+        if self.options.get("full_recovery_interval", 0) > 0 and not getattr(self.vec_env.env, "cfg", {}).get("test", False):
+            report = {}
+            try:
+                manifest = self._validate_recovery(filename)
+            except Exception as error:
+                report["error"] = repr(error)
+            self._gather_save_reports(report)
         checkpoint = torch.load(filename, map_location=self.device)
+        if manifest is not None:
+            if checkpoint["recovery_identity"] != manifest["identity"] or any(
+                    checkpoint[key] != manifest[key] for key in ("frame", "epoch", "optimizer_step")):
+                raise ValueError("Model and recovery manifest identities differ")
         expected = {"observation": self.observation_size, "state": self.state_size, "action": self.action_size}
         if checkpoint["schema"] != expected:
             raise ValueError("Checkpoint and environment observation/state/action schemas differ")
@@ -496,6 +596,15 @@ class FBAgent:
             shard = self.last_checkpoint.with_name(self.last_checkpoint.stem + ".rank" + str(self.global_rank) + ".replay.pt")
             if shard.exists():
                 saved = torch.load(shard, map_location=self.replay.device)
+                if self.options.get("full_recovery_interval", 0) > 0:
+                    manifest = self._validate_recovery(self.last_checkpoint)
+                    if saved["recovery_identity"] != manifest["identity"] or saved["rank"] != self.global_rank or any(
+                            saved[key] != manifest[key] for key in ("frame", "epoch", "optimizer_step")):
+                        raise ValueError("Replay and recovery manifest identities differ")
+                    rank_state = saved["rank_state"]
+                    self.observation_normalizer.load_state_dict(rank_state["observation_normalizer"])
+                    self.state_normalizer.load_state_dict(rank_state["state_normalizer"])
+                    self._restore_extra(rank_state)
                 self.replay.load_state_dict(saved["replay"])
                 # Retain off-policy experience, but start fresh episodes. Old
                 # physical tensors are not a GPU PhysX solver snapshot; copying
@@ -504,7 +613,8 @@ class FBAgent:
                     if name in saved["environment"]:
                         setattr(self.vec_env.env, name, saved["environment"][name])
                 torch.set_rng_state(saved["rng"].cpu())
-                torch.cuda.set_rng_state(saved["cuda_rng"].cpu(), self.device)
+                if saved["cuda_rng"] is not None:
+                    torch.cuda.set_rng_state(saved["cuda_rng"].cpu(), self.device)
                 np.random.set_state(saved["numpy_rng"])
                 random.setstate(saved["python_rng"])
             elif not self.options.get("allow_fresh_replay", False):
@@ -521,12 +631,21 @@ class FBAgent:
                     for _ in range(self.options["updates_per_iteration"]):
                         metrics.update(self.update())
                 self.epoch_num += 1
+                recovery_started = time.monotonic()
+                recovery_interval = self.options.get("full_recovery_interval", 0)
+                if recovery_interval > 0:
+                    warmup_boundary = self.replay.size == self.options["warmup_blocks"] - 1 and self.optimizer_step == 0
+                    update_boundary = self.optimizer_step > 0 and self.optimizer_step % recovery_interval == 0
+                    if warmup_boundary or update_boundary:
+                        self.save(self.nn_dir / ("recovery-" + str(self.optimizer_step) + ".pt"), replay=True)
+                recovery_seconds = time.monotonic() - recovery_started
+                metrics["timing/recovery_seconds"] = recovery_seconds
                 elapsed = time.monotonic() - self.run_started
                 rate = (self.frame - initial_frame) / max(elapsed, 1e-6)
                 remaining = max(0, self.options["target_frames"] - self.frame) / max(rate, 1)
                 metrics.update({
                     "timing/rollout_seconds": rollout_time,
-                    "timing/update_seconds": time.monotonic() - iteration_started - rollout_time,
+                    "timing/update_seconds": time.monotonic() - iteration_started - rollout_time - recovery_seconds,
                     "timing/environment_steps_per_second": rate,
                     "timing/projected_remaining_hours": remaining / 3600,
                     "timing/elapsed_hours": (elapsed + self.elapsed_before_resume) / 3600,

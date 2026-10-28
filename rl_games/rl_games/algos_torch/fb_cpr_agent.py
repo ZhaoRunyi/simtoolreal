@@ -22,7 +22,7 @@ from torch.nn import functional
 import yaml
 
 from rl_games.algos_torch.fb_agent import FBAgent
-from rl_games.algos_torch.fb_networks import project_task, successor_loss
+from rl_games.algos_torch.fb_networks import project_task, successor_loss, scalar_successor_loss
 from rl_games.algos_torch.fb_cpr_networks import (
     BatchNormalizer, CPRModel, ExpertSequences, RewardNormalizer, TransitionReplay, TemporalReplay,
 )
@@ -66,7 +66,7 @@ class FBcprAgent(FBAgent):
     @torch.no_grad()
     def save(self, filename, replay=False):
         super().save(filename, replay=replay)
-        if not replay or not self.options.get('record_inference_pool', False):
+        if not replay or Path(filename).stem.startswith('recovery-') or not self.options.get('record_inference_pool', False):
             return
         self._save_inference_pool(filename)
 
@@ -138,7 +138,8 @@ class FBcprAgent(FBAgent):
         for name in ('style_optimizer', 'discriminator_optimizer', 'action_normalizer', 'reward_normalizer'):
             getattr(self, name).load_state_dict(checkpoint[name])
         for name in ('z_buffer', 'z_position', 'z_size', 'expert_report'):
-            setattr(self, name, checkpoint[name])
+            value = checkpoint[name]
+            setattr(self, name, value.to(self.device) if isinstance(value, torch.Tensor) else value)
 
     @torch.no_grad()
     def _prepare_experts(self):
@@ -340,10 +341,56 @@ class FBcprAgent(FBAgent):
 
     def _log(self, metrics):
         # Probes need not coincide with log_interval; preserve their exact step.
-        metrics = {**metrics, **getattr(self, 'pending_actor_gradient_metrics', {})}
+        metrics = {**metrics, **getattr(self, 'pending_actor_gradient_metrics', {}),
+                   **getattr(self, 'pending_q_gradient_metrics', {})}
         result = super()._log(metrics)
         self.pending_actor_gradient_metrics = {}
+        self.pending_q_gradient_metrics = {}
         return result
+
+    def _scalar_fb_loss(self, forward, backward, target_forward, command, discount, valid, probe):
+        failure = torch.zeros((), dtype=torch.long, device=self.device)
+        error = None
+        try:
+            loss, metrics = scalar_successor_loss(
+                forward, backward, target_forward, command, discount, valid, spectrum=probe)
+        except (RuntimeError, ValueError, FloatingPointError) as exception:
+            error = repr(exception)
+            failure.fill_(1)
+        if self.world_size > 1:
+            distributed.all_reduce(failure, op=distributed.ReduceOp.MAX)
+        if failure.item():
+            # D/normalizers may already have changed in this update. Preserve
+            # evidence, but never serialize that partial update as a checkpoint.
+            path = self.output_dir / ('q_failure.step' + str(self.optimizer_step) + '.rank' + str(self.global_rank) + '.pt')
+            features = backward.detach()[valid.reshape(-1).bool()].double()
+            torch.save({
+                'error': error, 'frame': self.frame, 'optimizer_step': self.optimizer_step,
+                'rank': self.global_rank, 'world_size': self.world_size,
+                'network_dtype': str(forward.dtype), 'solve_dtype': 'torch.float64',
+                'covariance': (features.T @ features / max(len(features), 1)).cpu(),
+                'forward': forward.detach().cpu(), 'backward': backward.detach().cpu(),
+                'target_forward': target_forward.detach().cpu(), 'command': command.detach().cpu(),
+                'discount': discount.detach().cpu(), 'valid': valid.detach().cpu(),
+            }, path)
+            raise FloatingPointError('Scalar FB solve failed on at least one rank; see q_failure.step*.rank*.pt')
+        return loss, metrics
+
+    def _q_gradient_probe(self, fb_loss, weighted_q_loss):
+        parameters = tuple(self.model.forward_maps.parameters())
+        vectors = []
+        for loss in (fb_loss, weighted_q_loss):
+            gradients = torch.autograd.grad(loss, parameters, retain_graph=True)
+            vector = torch.cat([gradient.detach().reshape(-1) for gradient in gradients])
+            if self.world_size > 1:
+                distributed.all_reduce(vector)
+                vector.div_(self.world_size)
+            vectors.append(vector)
+        return {
+            'q_grad/fb_norm': vectors[0].norm(),
+            'q_grad/weighted_q_norm': vectors[1].norm(),
+            'q_grad/fb_q_cosine': functional.cosine_similarity(vectors[0], vectors[1], dim=0),
+        }
 
     @torch.no_grad()
     def _rollout_prompts(self):
@@ -526,12 +573,38 @@ class FBcprAgent(FBAgent):
         # sensitive reduction. Network matmuls retain the configured TF32 mode.
         previous_tf32 = torch.backends.cuda.matmul.allow_tf32
         torch.backends.cuda.matmul.allow_tf32 = False
-        fb_loss, orthogonal = successor_loss(forward, backward, target_forward, target_backward, discount, batch['valid'].squeeze(-1))
-        # Official orth loss is half the v1 convention.
-        representation_loss = fb_loss + .5 * self.options['orthogonal_coefficient'] * orthogonal
-        parameters = list(self.model.forward_maps.parameters()) + list(self.model.backward.parameters())
-        representation_grad = self._synchronize_step(representation_loss, self.representation_optimizer, parameters)
-        torch.backends.cuda.matmul.allow_tf32 = previous_tf32
+        try:
+            fb_loss, orthogonal = successor_loss(forward, backward, target_forward, target_backward, discount, batch['valid'].squeeze(-1))
+            # Official orth loss is half the v1 convention.
+            representation_loss = fb_loss + .5 * self.options['orthogonal_coefficient'] * orthogonal
+            q_coefficient = self.options.get('q_loss_coefficient', 0.)
+            q_probe = False
+            if q_coefficient > 0:
+                probe_every = self.options.get('actor_gradient_probe_every', 0)
+                q_probe = probe_every > 0 and self.optimizer_step % probe_every == 0
+                q_started = time.monotonic()
+                q_loss, q_metrics = self._scalar_fb_loss(
+                    forward, backward, target_forward, command, discount, batch['valid'], q_probe)
+                metrics.update(q_metrics)
+                weighted_q_loss = q_coefficient * q_loss
+                metrics['loss/q_td_weighted'] = weighted_q_loss.detach()
+                if q_probe:
+                    self.pending_q_gradient_metrics = {
+                        **self._q_gradient_probe(fb_loss, weighted_q_loss),
+                        **{name: value for name, value in q_metrics.items() if name.startswith('q_td/cov_')},
+                        'q_grad/probe_optimizer_step': q_loss.new_tensor(self.optimizer_step + 1),
+                        'q_grad/probe_environment_steps': q_loss.new_tensor(self.frame),
+                    }
+                metrics['timing/q_td_seconds'] = q_loss.new_tensor(time.monotonic() - q_started)
+                representation_loss = representation_loss + weighted_q_loss
+            parameters = list(self.model.forward_maps.parameters()) + list(self.model.backward.parameters())
+            representation_grad = self._synchronize_step(representation_loss, self.representation_optimizer, parameters)
+            if q_probe:
+                self.pending_q_gradient_metrics['q_grad/representation_clip_scale'] = (
+                    self.config['grad_norm'] / (representation_grad + 1e-6)).clamp(max=1)
+                metrics.update(self.pending_q_gradient_metrics)
+        finally:
+            torch.backends.cuda.matmul.allow_tf32 = previous_tf32
         with torch.no_grad():
             style_reward = self.model.discriminate(state, command).clamp(-16.118095, 16.118095)
             auxiliary_reward = self.reward_normalizer(batch['auxiliary_reward'].squeeze(-1))
