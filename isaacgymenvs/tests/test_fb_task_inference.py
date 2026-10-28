@@ -147,3 +147,31 @@ def test_command_reward_logging_uses_counts_not_average_of_means(tmp_path):
                          'command_reward_sum/expert_mean/total_reward': 8.})
     assert result['command_reward_step/random/total_reward'] == 1.5
     assert result['command_reward_step/expert_mean/total_reward'] == 4.
+
+
+def test_object_only_inference_uses_goal_errors_not_original_bonus(tmp_path):
+    states = torch.zeros(12, 162)
+    states[:, 137] = torch.linspace(0, .2, 12)
+    states[:, 138] = torch.linspace(.1, 0, 12)
+    components = torch.zeros(12, len(reward_components))
+    path = tmp_path / 'pool.pt'
+    pool = dict(frame=17, optimizer_step=5, world_size=1, rank=0,
+                schema_version=1, reward_names=reward_components,
+                sample_count=12, population=12, next_state=states,
+                reward_components=components)
+    torch.save(pool, path)
+    normalizer = torch.nn.Identity()
+    backward = torch.nn.Linear(162, 4)
+    torch.manual_seed(31)
+    torch.nn.init.normal_(backward.weight)
+    expected_reward = torch.exp(-20 * states[:, 137:149].reshape(-1, 4, 3).norm(dim=-1).amax(-1))
+    expected = project_task((backward(states) * expected_reward[:, None]).mean(0))
+    bank = infer_command_bank(backward, normalizer, [path], 17, 5, 'cpu',
+                              world_size=1, reward_definition='object_tracking')
+    torch.testing.assert_close(bank['commands'], expected.expand(3, -1))
+    assert bank['reward_kind'] == 'object_tracking'
+    pool['reward_components'][:, 7] = 1000000
+    torch.save(pool, path)
+    changed = infer_command_bank(backward, normalizer, [path], 17, 5, 'cpu',
+                                 world_size=1, reward_definition='object_tracking')
+    torch.testing.assert_close(changed['commands'], bank['commands'])
