@@ -6,7 +6,6 @@ BFM-Zero 05ad611 is the algorithm reference. Expert observations are collected
 from the published SimToolReal PPO teacher, not synthesized from object goals.
 """
 
-import copy
 import hashlib
 import json
 import math
@@ -299,6 +298,19 @@ class FBcprAgent(FBAgent):
     def _reward_json_digest(value):
         return hashlib.sha256(json.dumps(value, sort_keys=True, allow_nan=False).encode()).hexdigest()
 
+    @staticmethod
+    def _reward_plain_config(value):
+        from omegaconf import OmegaConf
+        # The production omegaconf_to_dict leaves ListConfig nodes nested in
+        # ordinary dicts. Resolve each node with its original parent context.
+        if OmegaConf.is_config(value):
+            return OmegaConf.to_container(value, resolve=True)
+        if isinstance(value, dict):
+            return {name: FBcprAgent._reward_plain_config(item) for name, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [FBcprAgent._reward_plain_config(item) for item in value]
+        return value
+
     def _reward_scene_mapping(self):
         environment = self.vec_env.env
         # Procedural URDF directories are process-local and already deleted
@@ -325,11 +337,7 @@ class FBcprAgent(FBAgent):
             raise ValueError('PPO reward collection requires 6144 scenes, 1500 steps and 256 fixed streams per rank')
         if getattr(environment, 'reference_reset_bank', None) is not None:
             raise ValueError('PPO reward collection must begin without a reference reset bank')
-        from omegaconf import OmegaConf
-        configuration = environment.cfg
-        if OmegaConf.is_config(configuration):
-            configuration = OmegaConf.to_container(configuration, resolve=True)
-        configuration = copy.deepcopy(configuration)
+        configuration = self._reward_plain_config(environment.cfg)
         initial_curriculum = {name: getattr(environment, name) for name in
                               ('success_tolerance', 'frame_since_restart', 'last_curriculum_update')}
         if (initial_curriculum['frame_since_restart'] != 0
@@ -341,6 +349,13 @@ class FBcprAgent(FBAgent):
             raise ValueError('PPO reward collection requires original training curriculum and goals')
         scene_mapping = self._reward_scene_mapping()
         collection_seed = torch.initial_seed()
+        # Fail before reset, stream selection or rollout if static metadata
+        # cannot be serialized. Keep the predeclared plain-JSON hash semantics.
+        configuration_sha256 = self._reward_json_digest(configuration)
+        scene_mapping_sha256 = self._reward_json_digest(scene_mapping)
+        json.dumps(initial_curriculum, allow_nan=False)
+        teacher_sha256 = checkpoint_digest(teacher_root / 'model.pth')
+        teacher_config_sha256 = checkpoint_digest(teacher_root / 'config.yaml')
         memory = [value.to(self.device) for value in teacher.get_default_rnn_state()]
         observations = {key: value.clone() for key, value in self.vec_env.reset().items()}
         selected = torch.randperm(self.num_actors, device=self.device)[:self.options['expert_environments']]
@@ -389,13 +404,13 @@ class FBcprAgent(FBAgent):
             'reward_names': list(reward_components), 'selected_environments': selected.cpu(),
             'steps': self.options['expert_steps'], 'simulation_environments': self.num_actors,
             'state_size': self.state_size, 'collection_environment_config': configuration,
-            'collection_environment_sha256': self._reward_json_digest(configuration),
+            'collection_environment_sha256': configuration_sha256,
             'seed': collection_seed, 'initial_curriculum': initial_curriculum,
-            'scene_mapping': scene_mapping, 'scene_mapping_sha256': self._reward_json_digest(scene_mapping),
+            'scene_mapping': scene_mapping, 'scene_mapping_sha256': scene_mapping_sha256,
             'simulation_transitions': self.num_actors * self.options['expert_steps'],
             'stored_transitions': len(selected) * self.options['expert_steps'],
-            'teacher_sha256': checkpoint_digest(teacher_root / 'model.pth'),
-            'teacher_config_sha256': checkpoint_digest(teacher_root / 'config.yaml'),
+            'teacher_sha256': teacher_sha256,
+            'teacher_config_sha256': teacher_config_sha256,
             'seconds': time.monotonic() - started,
             'timing': 'state/action before step; next_state, components, goal and object after reward; reset_before excluded, terminal retained',
             'rows': {name: torch.stack([row[name] for row in records]) for name in records[0]},

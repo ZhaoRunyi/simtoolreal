@@ -267,6 +267,8 @@ def test_rank_checkpoint_binds_model_replay_and_restores_sampling_rng(tmp_path, 
 
 def test_production_sidecar_collection_timing_terminal_and_identity(tmp_path):
     from types import SimpleNamespace
+    from omegaconf import OmegaConf
+    from isaacgymenvs.utils.reformat import omegaconf_to_dict
     from rl_games.algos_torch.fb_task_inference import checkpoint_digest, reward_components
     agent = make_mixed_agent(tmp_path)
     agent.num_actors = 6144
@@ -276,7 +278,10 @@ def test_production_sidecar_collection_timing_terminal_and_identity(tmp_path):
     (teacher_root / 'config.yaml').write_text('fixture: true\n')
     agent.options.update(expert_steps=1500, expert_environments=256, teacher_path=str(teacher_root))
     environment = SimpleNamespace(
-        cfg={'test': False, 'env': {'successTolerance': .1}},
+        cfg=omegaconf_to_dict(OmegaConf.create({
+            'test': False, 'env': {'successTolerance': .1, 'obsList': ['fixture']},
+            'sim': {'gravity': [0., 0., -9.81], 'nested': [{'values': [1, 2]}]},
+        })),
         success_tolerance=.1, initial_tolerance=.1, frame_since_restart=0, last_curriculum_update=0,
         object_asset_files=['fixture-a.urdf', 'fixture-b.urdf'],
         object_scales=torch.ones(6144, 3), reset_goal_buf=torch.zeros(6144, dtype=torch.long),
@@ -318,6 +323,8 @@ def test_production_sidecar_collection_timing_terminal_and_identity(tmp_path):
     agent._collect_reward_sidecar()
     path = agent.output_dir / 'reward_sidecar.rank0.pt'
     data = torch.load(path)
+    assert isinstance(data['collection_environment_config']['env']['obsList'], list)
+    assert isinstance(data['collection_environment_config']['sim']['nested'][0], dict)
     rows = data['rows']
     assert data['simulation_transitions'] == 9216000
     assert data['stored_transitions'] == 384000
@@ -368,3 +375,80 @@ def test_procedural_scene_identity_survives_process_tempdir_changes(tmp_path):
     assert agent._reward_scene_mapping() == original
     agent.vec_env.env.object_scales[1, 0] = 2
     assert agent._reward_scene_mapping() != original
+
+
+@pytest.mark.parametrize('rank', range(4))
+def test_actual_composed_collection_config_keeps_plain_digest(rank):
+    import json
+    from hydra import compose, initialize_config_dir
+    from omegaconf import ListConfig, OmegaConf
+    from isaacgymenvs.utils.reformat import omegaconf_to_dict
+    from rl_games.algos_torch.fb_cpr_agent import FBcprAgent
+
+    with initialize_config_dir(config_dir=str(Path(__file__).parents[1] / 'cfg'), version_base='1.1'):
+        config = compose(config_name='config', overrides=[
+            'task=SimToolRealLSTMAsymmetric', 'train=SimToolRealFBV15',
+            'headless=True', 'num_envs=6144', 'multi_gpu=True', 'seed=0',
+            'force_render=False', 'graphics_device_id=-1', 'wandb_activate=False',
+            'task.env.enableCameraSensors=False', 'task.env.capture_video=False',
+            'task.env.objectScaleNoiseMultiplierRange=[0.9,1.1]',
+            'task.env.forceConsecutiveNearGoalSteps=True',
+            'task.env.clearActionQueueOnReset=True', 'task.env.referenceResetProbability=1.0',
+            'train.params.config.fb.reference_reward_collection=True',
+        ])
+    config.seed = rank
+    # This is the actual make()->omegaconf_to_dict conversion, not a synthetic
+    # plain-dict approximation. Runtime-derived dimensions follow Sharpa.
+    hybrid = omegaconf_to_dict(config.task)
+    expected = OmegaConf.to_container(config.task, resolve=True)
+    assert isinstance(hybrid, dict) and isinstance(hybrid['env']['stateList'], ListConfig)
+    with pytest.raises(TypeError, match='ListConfig'):
+        json.dumps(hybrid)
+    for task in (hybrid, expected):
+        task['env'].update(numStates=162, numObservations=140, numActions=29)
+        task.update(rank=rank, rl_device='cuda:' + str(rank), device_type='cuda', device_id=rank, headless=True)
+    rng = torch.get_rng_state()
+    plain = FBcprAgent._reward_plain_config(hybrid)
+    assert plain == expected
+    assert FBcprAgent._reward_json_digest(plain) == FBcprAgent._reward_json_digest(expected)
+    assert torch.equal(torch.get_rng_state(), rng)
+    assert isinstance(hybrid['env']['stateList'], ListConfig)
+    assert isinstance(plain['env']['stateList'], list)
+
+
+def test_recursive_config_conversion_resolves_original_list_parent():
+    from omegaconf import OmegaConf
+    from isaacgymenvs.utils.reformat import omegaconf_to_dict
+    from rl_games.algos_torch.fb_cpr_agent import FBcprAgent
+    config = OmegaConf.create({'outside': 7, 'task': {'nested': [{'value': '${outside}'}]}})
+    hybrid = omegaconf_to_dict(config.task)
+    assert FBcprAgent._reward_plain_config(hybrid) == {'nested': [{'value': 7}]}
+    plain = {'scalar': 3, 'items': [True, None, {'negative': -2.5}]}
+    assert FBcprAgent._reward_json_digest(FBcprAgent._reward_plain_config(plain)) == FBcprAgent._reward_json_digest(plain)
+
+
+@pytest.mark.parametrize('invalid_section', ['configuration', 'scene_mapping', 'curriculum'])
+def test_collection_metadata_failure_precedes_reset_and_sampling(tmp_path, invalid_section):
+    from types import SimpleNamespace
+    agent = make_mixed_agent(tmp_path)
+    agent.num_actors = 6144
+    agent.options.update(expert_steps=1500, expert_environments=256)
+    environment = SimpleNamespace(cfg={'env': {}}, success_tolerance=.1, initial_tolerance=.1,
+                                  frame_since_restart=0, last_curriculum_update=0)
+    mapping = {'assets': []}
+    if invalid_section == 'configuration':
+        environment.cfg['unsupported'] = object()
+    elif invalid_section == 'scene_mapping':
+        mapping['unsupported'] = object()
+    else:
+        environment.frame_since_restart = torch.tensor(0)
+    agent.vec_env = SimpleNamespace(env=environment, reset=lambda: pytest.fail('Reset before metadata validation'))
+    agent._load_reference_policy = lambda: (None, {}, tmp_path / 'absent-teacher')
+    agent._reward_scene_mapping = lambda: mapping
+    rng = torch.get_rng_state()
+    sampling_rng = agent.reward_generator.get_state()
+    with pytest.raises(TypeError, match='JSON serializable'):
+        agent._collect_reward_sidecar()
+    assert torch.equal(torch.get_rng_state(), rng)
+    assert torch.equal(agent.reward_generator.get_state(), sampling_rng)
+    assert not (agent.output_dir / 'reward_sidecar.rank0.pt').exists()
