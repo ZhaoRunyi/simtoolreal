@@ -340,7 +340,7 @@ def require_training_approval(options, rank, reference, reset_bank):
 
     The approval is an external review artifact, never produced by collection or
     by this CPU geometry audit. Its initialization evidence must document the
-    historical state comparison; matching seeds alone cannot grant approval.
+    adopted protocol/loader/scene contract; historical full state is unavailable.
     """
     path = options.get('quality_training_approval_path')
     expected = options.get('quality_training_approval_sha256')
@@ -349,10 +349,34 @@ def require_training_approval(options, rank, reference, reset_bank):
     approval = json.loads(Path(path).read_text())
     require(approval['status'] == 'PASS_TRAINING_PRECONDITIONS', 'Training preconditions are not approved')
     require(approval['design_sha256'] == DESIGN_SHA256, 'Training approval design mismatch')
+    from rl_games.algos_torch.fb_reference_initialization import CONTRACT_SHA256
+    require(approval['schema_version'] == 2, 'Legacy historical-state boolean approval is invalid')
+    require(approval['initialization_contract_sha256'] == CONTRACT_SHA256, 'Initialization contract mismatch')
+    require(approval['source_kind'] == 'formal_ppo_collection', 'Synthetic data cannot authorize training')
     evidence = approval['initialization_evidence']
     require(digest(evidence['path']) == evidence['sha256'], 'Initialization evidence changed')
-    require(evidence['historical_state_match'] is True and evidence['reset_scene_mapping_match'] is True,
-            'Historical RNG/curriculum/scene and frozen reset mapping remain unproven')
+    initialization = json.loads(Path(evidence['path']).read_text())
+    require(initialization['contract_sha256'] == CONTRACT_SHA256, 'Initialization evidence contract mismatch')
+    require(initialization['historical_full_state_available'] is False,
+            'Do not fabricate historical PhysX/RNG full-state availability')
+    require('historical_state_match' not in initialization and 'historical_state_match' not in evidence,
+            'Historical full-state equality is not this protocol contract')
+    for gate in ('launch_protocol', 'cpu_quality_loader', 'reset_scene_provenance'):
+        receipt = initialization[gate]
+        require(digest(receipt['path']) == receipt['sha256'], 'Initialization gate evidence changed: ' + gate)
+        payload = json.loads(Path(receipt['path']).read_text())
+        require(payload['status'] == 'PASS' and payload['scope'] == gate,
+                'Initialization gate is incomplete: ' + gate)
+        require(payload['contract_sha256'] == CONTRACT_SHA256, 'Gate contract mismatch: ' + gate)
+    require(len(initialization['rank_events']) == len(initialization['expected_scenes']) == len(initialization['expected_launches']) == 4,
+            'Initialization protocol must cover four ranks')
+    require(bool(initialization['production_files']), 'Startup source/dependency identities are required')
+    require([event['rank'] for event in initialization['rank_events']] == list(range(4)),
+            'Initialization rank trace is missing or reordered')
+    require(initialization['cpu_quality_cache_sha256'][rank] == digest(reference),
+            'CPU loader test did not use this formal quality cache')
+    require(initialization['original_reset_sha256'][rank] == digest(reset_bank),
+            'Initialization provenance did not use this original bank')
     audit_identity = approval['data_audit']
     require(digest(audit_identity['path']) == audit_identity['sha256'], 'Independent data audit changed')
     audit = json.loads(Path(audit_identity['path']).read_text())
@@ -364,6 +388,7 @@ def require_training_approval(options, rank, reference, reset_bank):
     report = next(row for row in rank_reports if row['rank'] == rank)
     require(report['input_sha256']['quality_references.pt'] == digest(reference), 'Audited cache identity mismatch')
     require(approval['original_reset_sha256'][rank] == digest(reset_bank), 'Approved reset bank identity mismatch')
+    return {'initialization': initialization, 'approval_sha256': expected, 'approval_path': str(path)}
 
 
 if __name__ == '__main__':

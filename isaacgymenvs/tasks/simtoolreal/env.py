@@ -1795,7 +1795,8 @@ class SimToolReal(VecTask):
         )
         # Procedural URDFs live in a temporary directory. Retain only the XML
         # needed by the configured viewer environment before cleanup.
-        if self.cfg['env'].get('recordReferenceQuality', False):
+        if (self.cfg['env'].get('recordReferenceQuality', False)
+                or self.cfg['env'].get('validateReferenceInitialization', False)):
             from rl_games.algos_torch.fb_reference_quality import asset_manifest
             self.reference_quality_assets = [
                 asset_manifest(Path(asset_root) / filename)
@@ -2275,6 +2276,12 @@ class SimToolReal(VecTask):
         self.object_keypoint_offsets_fixed_size = to_torch(
             object_keypoint_offsets_fixed_size, dtype=torch.float, device=self.device
         )
+
+        if self.cfg["env"].get("validateReferenceInitialization", False):
+            self.reference_initialization_assets = {
+                "robot": [robot_asset], "object": object_assets,
+                "table_object": [table_asset], "goal_object": self.goal_assets,
+            }
 
         self.joint_names = self.gym.get_actor_joint_names(env_ptr, robot_actor)
         props = self.gym.get_actor_dof_properties(env_ptr, robot_actor)

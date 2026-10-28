@@ -255,6 +255,9 @@ def launch_rlg_hydra(cfg: DictConfig, vec_env=None):
     runner.load(rlg_config_dict)
     runner.set_vec_env(vec_env)
     runner.reset()
+    if not cfg.test and cfg.train.params.config.get('fb', {}).get('quality_reference_path'):
+        from rl_games.algos_torch.fb_reference_initialization import record_launch_protocol
+        record_launch_protocol(cfg, rlg_config_dict, runner)
 
     # dump config dict
     if not cfg.test:

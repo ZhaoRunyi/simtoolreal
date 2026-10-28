@@ -146,13 +146,19 @@ class FBcprAgent(FBAgent):
         if self.options.get('quality_reference_path'):
             reference = Path(self.options['quality_reference_path'].format(rank=self.global_rank))
             from rl_games.algos_torch.fb_reference_audit import require_training_approval
-            require_training_approval(self.options, self.global_rank, reference, path)
+            approval = require_training_approval(self.options, self.global_rank, reference, path)
+            from rl_games.algos_torch.fb_reference_initialization import begin_loader_check, finish_loader_check
+            initialization_check = begin_loader_check(self, approval)
             expected = self.options['quality_reference_sha256'][self.global_rank]
             if checkpoint_digest(reference) != expected:
                 raise ValueError('Quality reference cache identity changed')
             if self.vec_env.env.cfg['env']['referenceResetProbability'] != 1.0:
                 raise ValueError('Quality learner must preserve actual v4 reset probability 1.0')
             data = torch.load(reference, map_location=self.device)
+            if data['states'].ndim != 3 or data['states'].shape[-1] != self.state_size:
+                raise ValueError('Quality reference state schema differs from actual learner')
+            if data['valid'].shape != data['states'].shape[:2]:
+                raise ValueError('Quality reference validity schema differs')
             if not data['report']['ready'] or data['report']['complete_fraction'] < .5:
                 raise ValueError('Quality reference budget/ratio not certified')
             reset_identity = self.options['original_reset_sha256'][self.global_rank]
@@ -171,6 +177,7 @@ class FBcprAgent(FBAgent):
                 if not len(starts):
                     raise ValueError('Certified references lack required window length ' + str(length))
                 self.experts.starts[length] = starts
+            finish_loader_check(self, initialization_check, reference, path)
             return
         if path.exists():
             data = torch.load(path, map_location=self.device)
