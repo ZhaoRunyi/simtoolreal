@@ -1,0 +1,12 @@
+defaults:
+  - SimToolRealFBV4
+  - _self_
+
+params:
+  config:
+    name: ${resolve_default:SimToolRealFBV16,${....experiment}}
+    fb:
+      actor_gradient_projection: true
+      joint_limit_coefficient: 0.0
+      target_frames: 19120128
+      max_seconds: 21600

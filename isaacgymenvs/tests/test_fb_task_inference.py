@@ -147,3 +147,65 @@ def test_command_reward_logging_uses_counts_not_average_of_means(tmp_path):
                          'command_reward_sum/expert_mean/total_reward': 8.})
     assert result['command_reward_step/random/total_reward'] == 1.5
     assert result['command_reward_step/expert_mean/total_reward'] == 4.
+
+
+def test_object_only_inference_uses_goal_errors_not_original_bonus(tmp_path):
+    states = torch.zeros(12, 162)
+    states[:, 137] = torch.linspace(0, .2, 12)
+    states[:, 138] = torch.linspace(.1, 0, 12)
+    components = torch.zeros(12, len(reward_components))
+    path = tmp_path / 'pool.pt'
+    pool = dict(frame=17, optimizer_step=5, world_size=1, rank=0,
+                schema_version=1, reward_names=reward_components,
+                sample_count=12, population=12, next_state=states,
+                reward_components=components)
+    torch.save(pool, path)
+    normalizer = torch.nn.Identity()
+    backward = torch.nn.Linear(162, 4)
+    torch.manual_seed(31)
+    torch.nn.init.normal_(backward.weight)
+    expected_reward = torch.exp(-20 * states[:, 137:149].reshape(-1, 4, 3).norm(dim=-1).amax(-1))
+    expected = project_task((backward(states) * expected_reward[:, None]).mean(0))
+    bank = infer_command_bank(backward, normalizer, [path], 17, 5, 'cpu',
+                              world_size=1, reward_definition='object_tracking')
+    torch.testing.assert_close(bank['commands'], expected.expand(3, -1))
+    assert bank['reward_kind'] == 'object_tracking'
+    pool['reward_components'][:, 7] = 1000000
+    torch.save(pool, path)
+    changed = infer_command_bank(backward, normalizer, [path], 17, 5, 'cpu',
+                                 world_size=1, reward_definition='object_tracking')
+    torch.testing.assert_close(changed['commands'], bank['commands'])
+
+
+def test_object_tracking_cli_accepts_registered_evaluation_arguments(tmp_path, monkeypatch):
+    import sys
+    from rl_games.algos_torch.fb_cpr_networks import BackwardMap, BatchNormalizer
+    from rl_games.algos_torch import fb_task_inference
+    torch.manual_seed(10)
+    backward = BackwardMap(153, 4, list(range(152)) + [158])
+    normalizer = BatchNormalizer(162).eval()
+    checkpoint = tmp_path / 'last.pt'
+    torch.save({'options': {'backward_state_size': 153, 'latent_size': 4,
+                            'backward_state_indices': list(range(152)) + [158]},
+                'schema': {'state': 162}, 'state_normalizer': normalizer.state_dict(),
+                'model': {'backward.' + name: value for name, value in backward.state_dict().items()},
+                'frame': 17, 'optimizer_step': 5, 'training_world_size': 1}, checkpoint)
+    states = torch.randn(12, 162)
+    states[:, 137:149] *= .03
+    pool = tmp_path / 'last.rank0.inference.pt'
+    torch.save({'frame': 17, 'optimizer_step': 5, 'world_size': 1, 'rank': 0,
+                'schema_version': 1, 'reward_names': reward_components,
+                'sample_count': 12, 'population': 12, 'next_state': states,
+                'reward_components': torch.zeros(12, len(reward_components))}, pool)
+    output = tmp_path / 'object_bank.pt'
+    monkeypatch.setattr(sys, 'argv', ['inference', '--checkpoint', str(checkpoint),
+                                    '--pool-glob', str(pool), '--output', str(output),
+                                    '--device', 'cpu', '--method', 'mean',
+                                    '--reward-definition', 'object_tracking'])
+    fb_task_inference.main()
+    bank = torch.load(output)
+    expected = infer_command_bank(backward, normalizer, [pool], 17, 5, 'cpu',
+                                  world_size=1, reward_definition='object_tracking')
+    torch.testing.assert_close(bank['commands'], expected['commands'], rtol=0, atol=0)
+    assert bank['reward_kind'] == 'object_tracking'
+    assert bank['checkpoint_sha256'] == fb_task_inference.checkpoint_digest(checkpoint)

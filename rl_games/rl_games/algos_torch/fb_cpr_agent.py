@@ -9,6 +9,7 @@ from the published SimToolReal PPO teacher, not synthesized from object goals.
 import copy
 import json
 import math
+import random
 import time
 from pathlib import Path
 
@@ -22,6 +23,7 @@ from torch.nn import functional
 import yaml
 
 from rl_games.algos_torch.fb_agent import FBAgent
+from rl_games.algos_torch.fb_actor_gradients import ActorGradientAccumulator, ratio_metric, require_finite, vector_metrics
 from rl_games.algos_torch.fb_networks import project_task, successor_loss
 from rl_games.algos_torch.fb_cpr_networks import (
     BatchNormalizer, CPRModel, ExpertSequences, RewardNormalizer, TransitionReplay, TemporalReplay,
@@ -127,10 +129,16 @@ class FBcprAgent(FBAgent):
             'z_buffer': self.z_buffer, 'z_position': self.z_position, 'z_size': self.z_size,
             'expert_report': self.expert_report,
             'training_world_size': self.world_size,
+            'projection_updates': getattr(self, 'projection_updates', 0),
+            'projection_conflicts': getattr(self, 'projection_conflicts', 0),
+            'projection_sums': getattr(self, 'projection_sums', {}),
         }
 
     def _restore_extra(self, checkpoint):
         self.training_world_size = checkpoint.get('training_world_size')
+        self.projection_updates = checkpoint.get('projection_updates', 0)
+        self.projection_conflicts = checkpoint.get('projection_conflicts', 0)
+        self.projection_sums = checkpoint.get('projection_sums', {})
         if 'z_source_buffer' in checkpoint:
             self.z_source_buffer.copy_(checkpoint['z_source_buffer'])
         elif self.options.get('log_command_sources', False):
@@ -295,6 +303,37 @@ class FBcprAgent(FBAgent):
                                      + self.options['auxiliary_coefficient'] * q_auxiliary.mean())
         return loss, q_fb, q_style, q_auxiliary
 
+    def _gradient_strata(self, batch, candidate=None, relabel=None):
+        # Identical keys/order on every rank, including old replay without labels.
+        count = len(batch['state'])
+        unknown = torch.full((count,), -1, dtype=torch.long, device=self.device)
+        behavior = batch.get('command_source', unknown).reshape(-1)
+        strata = {}
+        sources = ((-1, 'unknown'), (0, 'random'), (1, 'replay_goal'),
+                   (2, 'expert_mean'), (3, 'expert_sequence'))
+        for source, name in sources:
+            strata['behavior_' + name] = behavior == source
+            if candidate is not None:
+                strata['candidate_' + name] = candidate == source
+                final = torch.where(relabel.reshape(-1), candidate, behavior)
+                strata['final_' + name] = final == source
+        if candidate is not None:
+            strata['relabeled'] = relabel.reshape(-1)
+            strata['behavior_retained'] = ~relabel.reshape(-1)
+        known = torch.zeros(count, device=self.device, dtype=torch.bool)
+        height = linear = angular = lifted = reset = torch.zeros(count, device=self.device)
+        if 'actor_diagnostic' in batch:
+            height, linear, angular, lifted, reset = batch['actor_diagnostic'].unbind(-1)
+            known = batch.get('actor_diagnostic_valid', torch.ones_like(height)).reshape(-1).bool()
+        terminal = batch['discount'].reshape(-1) == 0
+        live = known & ~terminal & (reset == 0)
+        strata.update(physical_unknown=~known, physical_low=live & (height <= .05),
+                      physical_middle=live & (height > .05) & (height < .15),
+                      physical_high=live & (height >= .15),
+                      physical_slow_high=live & (height >= .15) & (linear <= .3) & (angular <= 3),
+                      terminal=terminal, reset=known & (reset != 0), lifted_history=known & (lifted != 0))
+        return strata
+
     def _actor_gradient_probe(self, q_fb, q_style, q_auxiliary):
         """Measure weighted branch gradients on the actual sampled actor graph.
 
@@ -326,6 +365,17 @@ class FBcprAgent(FBAgent):
         actual_update = torch.cat([parameter.detach().reshape(-1) for parameter in parameters]) - before
         # .grad has already been averaged and clipped by the production step.
         clipped_gradient = torch.cat([parameter.grad.reshape(-1) for parameter in parameters])
+        if self.options.get('actor_gradient_projection', False):
+            metrics = vector_metrics(vectors, 'actor_grad/')
+            metrics['actor_grad/update_norm'] = actual_update.double().norm()
+            for name, vector in vectors.items():
+                ratio_metric(metrics, 'actor_grad/' + name + '_update_cosine',
+                             -vector.double().dot(actual_update.double()),
+                             vector.double().norm() * actual_update.double().norm())
+            ratio_metric(metrics, 'actor_grad/fb_total_cosine',
+                         vectors['fb'].double().dot(clipped_gradient.double()),
+                         vectors['fb'].double().norm() * clipped_gradient.double().norm())
+            return metrics
         metrics = {'actor_grad/update_norm': actual_update.norm()}
         for name, vector in vectors.items():
             metrics['actor_grad/' + name + '_norm'] = vector.norm()
@@ -341,7 +391,22 @@ class FBcprAgent(FBAgent):
     def _log(self, metrics):
         # Probes need not coincide with log_interval; preserve their exact step.
         metrics = {**metrics, **getattr(self, 'pending_actor_gradient_metrics', {})}
-        result = super()._log(metrics)
+        if self.options.get('actor_gradient_projection', False):
+            # The training loop merges many updates. Drop a previous update's
+            # ratio when the current denominator is zero, instead of logging it.
+            for name, value in list(metrics.items()):
+                if name.endswith('_valid') and not value:
+                    metrics.pop(name[:-len('_valid')], None)
+            for prefix in ('pcgrad/', 'pcgrad_probe/'):
+                if prefix + 'conflict' in metrics and not metrics[prefix + 'conflict']:
+                    metrics.pop(prefix + 'fb_projection_residual', None)
+                    metrics.pop(prefix + 'style_projection_residual', None)
+        try:
+            result = super()._log(metrics)
+        except FloatingPointError as error:
+            if self.options.get('actor_gradient_projection', False):
+                self._save_nonfinite_state(error)
+            raise
         self.pending_actor_gradient_metrics = {}
         return result
 
@@ -398,6 +463,13 @@ class FBcprAgent(FBAgent):
             action = self._sample_action(self._history_input(history, previous_action),
                                          self.state_normalizer(self.observations['states']), self.rollout_command)
             current = {key: value.clone() for key, value in self.observations.items()}
+            diagnostic = None
+            if self.options.get('actor_gradient_projection', False):
+                physical = environment.root_state_tensor[environment.object_indices]
+                diagnostic = torch.stack((
+                    physical[:, 2] - environment.object_init_state[:, 2],
+                    physical[:, 7:10].norm(dim=-1), physical[:, 10:13].norm(dim=-1),
+                    environment.lifted_object.float(), self.reset_before.float()), dim=-1).clone()
             observations, reward, done, info = self.vec_env.step(action)
             observations = {key: value.clone() for key, value in observations.items()}
             done = done.bool()
@@ -414,6 +486,10 @@ class FBcprAgent(FBAgent):
                 'discount': self.config['gamma'] * (~done).float().unsqueeze(-1),
                 'valid': (~self.reset_before).unsqueeze(-1).clone(),
             })
+            if diagnostic is not None:
+                records[-1]['actor_diagnostic'] = diagnostic
+                records[-1]['actor_diagnostic_valid'] = torch.ones_like(done[:, None])
+                records[-1]['command_source'] = self.rollout_command_source[:, None].clone()
             if self.options.get('record_inference_pool', False):
                 records[-1]['reward_components'] = torch.stack(
                     [info['episode_cumulative'][name] for name in reward_components], dim=-1
@@ -480,6 +556,57 @@ class FBcprAgent(FBAgent):
                 'discriminator/expert_logit': real.detach().mean(), 'discriminator/online_logit': fake.detach().mean()}
 
     def update(self):
+        try:
+            return self._update_impl()
+        except FloatingPointError as error:
+            if self.options.get('actor_gradient_projection', False):
+                self._save_nonfinite_state(error)
+            raise
+
+    def _save_nonfinite_state(self, error):
+        """Each rank saves its own failure state; this is not a resumable step.
+
+        Finite guards synchronize before raising. A final collective waits for
+        every shard before torchrun can terminate peers; no pool is sampled.
+        """
+        payload = {
+            'failure': repr(error), 'resumable': False, 'rank': self.global_rank,
+            'frame': self.frame, 'optimizer_step': self.optimizer_step,
+            'model': self.model.state_dict(), 'target': self.target.state_dict(),
+            'actor_gradients': [parameter.grad for parameter in self.model.actor.parameters()],
+            'observation_normalizer': self.observation_normalizer.state_dict(),
+            'state_normalizer': self.state_normalizer.state_dict(),
+            'actor_optimizer': self.actor_optimizer.state_dict(),
+            'representation_optimizer': self.representation_optimizer.state_dict(),
+            'auxiliary_optimizer': self.auxiliary_optimizer.state_dict(),
+            **self._checkpoint_extra(), 'options': self.options,
+            'rng': torch.get_rng_state(), 'numpy_rng': np.random.get_state(),
+            'python_rng': random.getstate(),
+            'cuda_rng': torch.cuda.get_rng_state(self.device) if self.device.type == 'cuda' else None,
+            'replay': self.replay.state_dict(),
+        }
+        if hasattr(self.vec_env, 'get_env_state'):
+            payload['environment'] = self.vec_env.get_env_state()
+        for name in ('observations', 'history', 'previous_action', 'rollout_command',
+                     'rollout_command_source', 'command_age', 'reset_before', 'history_reset',
+                     'episode_reward', 'rollout_step', 'tracking_indices', 'tracking_prompts'):
+            if hasattr(self, name):
+                payload[name] = getattr(self, name)
+        path = self.nn_dir / ('nonfinite.rank' + str(self.global_rank) + '.pt')
+        temporary = path.with_suffix('.tmp')
+        write_error = None
+        try:
+            torch.save(payload, temporary)
+            temporary.replace(path)
+        except Exception as error:
+            write_error = error
+        saved = torch.tensor(int(write_error is None), device=self.device)
+        if self.world_size > 1:
+            distributed.all_reduce(saved, op=distributed.ReduceOp.MIN)
+        if not saved.item():
+            raise RuntimeError('Could not save nonfinite state on every rank') from write_error
+
+    def _update_impl(self):
         batch = self.replay.sample(self.config['minibatch_size'])
         for normalizer, name in ((self.observation_normalizer, 'observation'), (self.state_normalizer, 'state')):
             normalizer.train()
@@ -553,12 +680,21 @@ class FBcprAgent(FBAgent):
         critics = list(self.model.forward_maps.parameters()) + list(self.model.style_maps.parameters()) + list(self.model.auxiliary_maps.parameters())
         for parameter in critics:
             parameter.requires_grad_(False)
+        projected = self.options.get('actor_gradient_projection', False)
         actor_loss, q_fb, q_style, q_auxiliary = self._actor_objective(state, history, command)
+        if projected:
+            require_finite([actor_loss], self.world_size)
         probe_every = self.options.get('actor_gradient_probe_every', 0)
         probe = self._actor_gradient_probe(q_fb, q_style, q_auxiliary) if (
             probe_every > 0 and self.optimizer_step % probe_every == 0) else None
         self.actor_optimizer.zero_grad(set_to_none=True)
-        self._backward_loss(actor_loss)
+        accumulator = ActorGradientAccumulator(self.model.actor.parameters(), self.world_size, probe is not None) if projected else None
+        if projected:
+            accumulator.add((q_fb, q_style, q_auxiliary),
+                            (self.options['style_coefficient'], self.options['auxiliary_coefficient']),
+                            strata=self._gradient_strata(batch, sources, relabel))
+        else:
+            self._backward_loss(actor_loss)
         actor_loss = actor_loss.detach()
         q_fb, q_style, q_auxiliary = q_fb.detach(), q_style.detach(), q_auxiliary.detach()
         if self.options.get('logo_coefficient', 0) > 0:
@@ -574,24 +710,59 @@ class FBcprAgent(FBAgent):
                 with torch.no_grad():
                     local_command = self.model.backward(self.state_normalizer(window['local_state']))
                     goal_command = self.model.backward(self.state_normalizer(window['goal_state']))
-                local_loss = self._actor_objective(local_state, local_history, local_command)[0]
-                # Backpropagate each term before constructing the next graph.
-                # Accumulate the same weighted sum, then synchronize/clip/step once.
-                self._backward_loss(self.options['logo_coefficient'] * self.options['logo_local_weight'] * local_loss)
-                local_loss = local_loss.detach()
-                goal_loss = self._actor_objective(local_state, local_history, goal_command)[0]
-                self._backward_loss(self.options['logo_coefficient'] * self.options['logo_goal_weight'] * goal_loss)
-                goal_loss = goal_loss.detach()
+                branch_losses = []
+                for label, branch_command in (('local', local_command), ('goal', goal_command)):
+                    branch_loss, *branch_values = self._actor_objective(local_state, local_history, branch_command)
+                    weight = self.options['logo_coefficient'] * self.options['logo_' + label + '_weight']
+                    if projected:
+                        require_finite([branch_loss], self.world_size)
+                        accumulator.add(branch_values,
+                                        (self.options['style_coefficient'], self.options['auxiliary_coefficient']),
+                                        weight, label, self._gradient_strata(window))
+                    else:
+                        self._backward_loss(weight * branch_loss)
+                    branch_losses.append(branch_loss.detach())
+                local_loss, goal_loss = branch_losses
                 pair_loss = self.options['logo_local_weight'] * local_loss + self.options['logo_goal_weight'] * goal_loss
                 actor_loss = actor_loss + self.options['logo_coefficient'] * pair_loss
                 metrics.update({'loss/logo_local': local_loss.detach(), 'loss/logo_goal': goal_loss.detach(),
                                 'loss/logo_scaled': self.options['logo_coefficient'] * pair_loss.detach()})
-        actor_grad = self._step_accumulated_gradients(self.actor_optimizer, self.model.actor.parameters())
+        if projected:
+            require_finite([actor_loss], self.world_size)
+            accumulator.assign()
+        actor_grad = self._step_accumulated_gradients(self.actor_optimizer, self.model.actor.parameters(),
+                                                      synchronize=not projected)
+        if projected:
+            projection_metrics = accumulator.after_step(self.config.get('grad_norm', 1.0), actor_grad)
+            self.projection_updates = getattr(self, 'projection_updates', 0) + 1
+            self.projection_conflicts = getattr(self, 'projection_conflicts', 0) + int(projection_metrics['pcgrad/conflict'].item())
+            self.projection_sums = getattr(self, 'projection_sums', {})
+            for name in ('pair_norm_ratio', 'clip_scale', 'clipped', 'gradient_norm'):
+                value = projection_metrics.get('pcgrad/' + name)
+                total, count = self.projection_sums.get(name, (0.0, 0))
+                if value is not None:
+                    total += value.item()
+                    count += 1
+                self.projection_sums[name] = (total, count)
+                projection_metrics['pcgrad/' + name + '_count'] = actor_grad.new_tensor(count)
+                projection_metrics['pcgrad/' + name + '_zero_denominator_count'] = actor_grad.new_tensor(self.projection_updates - count)
+                if count:
+                    projection_metrics['pcgrad/' + name + '_mean'] = actor_grad.new_tensor(total / count)
+            projection_metrics['pcgrad/conflict_fraction'] = actor_grad.new_tensor(self.projection_conflicts / self.projection_updates)
+            projection_metrics['pcgrad/updates'] = actor_grad.new_tensor(self.projection_updates)
+            projection_metrics['pcgrad/optimizer_step'] = actor_grad.new_tensor(self.optimizer_step + 1)
+            metrics.update(projection_metrics)
+            if probe is not None:
+                sparse = {('pcgrad_probe/' + name[len('pcgrad/'):]) if name.startswith('pcgrad/') else name: value
+                          for name, value in projection_metrics.items()}
+                sparse['pcgrad_full/probe_optimizer_step'] = actor_grad.new_tensor(self.optimizer_step + 1)
+                sparse['pcgrad_full/probe_environment_steps'] = actor_grad.new_tensor(self.frame)
+                self.pending_actor_gradient_metrics = {**getattr(self, 'pending_actor_gradient_metrics', {}), **sparse}
         if probe is not None:
             probe_metrics = self._actor_gradient_metrics(*probe)
             probe_metrics['actor_grad/probe_optimizer_step'] = actor_grad.new_tensor(self.optimizer_step + 1)
             probe_metrics['actor_grad/probe_environment_steps'] = actor_grad.new_tensor(self.frame)
-            self.pending_actor_gradient_metrics = probe_metrics
+            self.pending_actor_gradient_metrics = {**getattr(self, 'pending_actor_gradient_metrics', {}), **probe_metrics}
             metrics.update(probe_metrics)
         for parameter in critics:
             parameter.requires_grad_(True)

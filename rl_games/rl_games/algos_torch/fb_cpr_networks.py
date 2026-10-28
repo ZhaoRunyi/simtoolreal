@@ -234,10 +234,19 @@ class TransitionReplay:
         if self.storage is None:
             self.storage = {
                 name: torch.empty((self.capacity,) + value.shape,
-                                  dtype=torch.float16 if value.is_floating_point() and name not in ('reward', 'discount', 'reward_components') else value.dtype,
+                                  dtype=torch.float16 if value.is_floating_point() and name not in ('reward', 'discount', 'reward_components', 'actor_diagnostic') else value.dtype,
                                   device=self.device)
                 for name, value in block.items()
             }
+        # Optional observability fields may appear after restoring an older ring.
+        # Unknown historical rows stay unknown; insertion and sampling use no RNG.
+        defaults = {'command_source': -1, 'actor_diagnostic': 0, 'actor_diagnostic_valid': False}
+        for name, default in defaults.items():
+            if name in block and name not in self.storage:
+                self.storage[name] = torch.full((self.capacity,) + block[name].shape, default,
+                                                dtype=block[name].dtype, device=self.device)
+            if name in self.storage and name not in block:
+                self.storage[name][self.position].fill_(default)
         for name, value in block.items():
             self.storage[name][self.position].copy_(value)
         self.valid_indices[self.position] = block['valid'].flatten().nonzero().flatten()

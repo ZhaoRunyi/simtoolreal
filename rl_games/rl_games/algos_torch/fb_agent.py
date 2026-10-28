@@ -141,11 +141,11 @@ class FBAgent:
             raise FloatingPointError("Nonfinite FB training loss on one or more ranks")
         loss.backward()
 
-    def _step_accumulated_gradients(self, optimizer, parameters):
+    def _step_accumulated_gradients(self, optimizer, parameters, synchronize=True):
         parameters = list(parameters)
         gradients = [parameter.grad.reshape(-1) for parameter in parameters if parameter.grad is not None]
         packed = torch.cat(gradients)
-        if self.world_size > 1:
+        if synchronize and self.world_size > 1:
             distributed.all_reduce(packed)
             packed.div_(self.world_size)
             offset = 0
