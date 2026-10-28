@@ -62,6 +62,12 @@ class FBcprAgent(FBAgent):
         self.z_size = 0
         self.experts = None
         self.expert_report = None
+        self.reference_reset_only = self.options.get('reference_reset_only', False)
+        if self.reference_reset_only:
+            if self.options['style_coefficient'] != 0 or self.options['tracking_fraction'] != 0:
+                raise ValueError('Reset-only reference use requires zero style and reference tracking')
+            self.model.style_maps.requires_grad_(False)
+            self.model.discriminator.requires_grad_(False)
 
     @torch.no_grad()
     def save(self, filename, replay=False):
@@ -127,9 +133,12 @@ class FBcprAgent(FBAgent):
             'z_buffer': self.z_buffer, 'z_position': self.z_position, 'z_size': self.z_size,
             'expert_report': self.expert_report,
             'training_world_size': self.world_size,
+            'reference_reset_only': self.reference_reset_only,
         }
 
     def _restore_extra(self, checkpoint):
+        if checkpoint.get('reference_reset_only', False) != self.reference_reset_only:
+            raise ValueError('Cannot resume a different reference-use experiment')
         self.training_world_size = checkpoint.get('training_world_size')
         if 'z_source_buffer' in checkpoint:
             self.z_source_buffer.copy_(checkpoint['z_source_buffer'])
@@ -143,6 +152,17 @@ class FBcprAgent(FBAgent):
     @torch.no_grad()
     def _prepare_experts(self):
         path = self.output_dir / ('expert.rank' + str(self.global_rank) + '.pt')
+        if self.reference_reset_only:
+            if not path.exists():
+                raise FileNotFoundError('Reset-only training requires the identity-verified original reset bank')
+            data = torch.load(path, map_location='cpu')
+            self.vec_env.env.reference_reset_bank = {
+                name: value.to(self.device) for name, value in data['resets'].items()
+            }
+            self.vec_env.env.record_reference_reset_statistics = True
+            self.expert_report = {'reset_only': True}
+            self.experts = None
+            return
         if path.exists():
             data = torch.load(path, map_location=self.device)
             self.experts = ExpertSequences(data['states'], data['valid'])
@@ -288,7 +308,9 @@ class FBcprAgent(FBAgent):
         action = self._sample_action(history, state, command, self.options['target_noise_clip'])
         critic_state = torch.cat((state, history), -1)
         q_fb = (self.model(critic_state, action, command) * command).sum(-1).min(0).values
-        q_style = self.model.style(critic_state, action, command).min(0).values
+        # A graph-connected zero lets the existing gradient monitor report an
+        # exact zero branch without evaluating or training the frozen critic.
+        q_style = q_fb * 0 if self.reference_reset_only else self.model.style(critic_state, action, command).min(0).values
         q_auxiliary = self.model.auxiliary(critic_state, action, command).min(0).values
         scale = q_fb.detach().abs().mean()
         loss = -q_fb.mean() - scale * (self.options['style_coefficient'] * q_style.mean()
@@ -342,6 +364,17 @@ class FBcprAgent(FBAgent):
         # Probes need not coincide with log_interval; preserve their exact step.
         metrics = {**metrics, **getattr(self, 'pending_actor_gradient_metrics', {})}
         result = super()._log(metrics)
+        if self.reference_reset_only:
+            # Parent metrics are rank-averaged. Retain the actual reset counts
+            # on every rank as well; these counters restart with the process.
+            statistics = getattr(self.vec_env.env, 'reference_reset_statistics', {})
+            record = {name: float(value) for name, value in statistics.items()}
+            record.update(rank=self.global_rank, environment_steps=self.frame,
+                          optimizer_step=self.optimizer_step,
+                          counters_since_process_start=True)
+            path = self.output_dir / ('reference_reset.rank' + str(self.global_rank) + '.jsonl')
+            with path.open('a') as stream:
+                stream.write(json.dumps(record, allow_nan=False) + '\n')
         self.pending_actor_gradient_metrics = {}
         return result
 
@@ -352,6 +385,8 @@ class FBcprAgent(FBAgent):
         self.rollout_command = torch.where(refresh[:, None], candidates, self.rollout_command)
         self.rollout_command_source = torch.where(refresh, self.sampled_command_source, self.rollout_command_source)
         self.command_age = torch.where(refresh, 0, self.command_age)
+        if self.reference_reset_only:
+            return
         length = self.options['tracking_length']
         if self.rollout_step % length == 0:
             self.tracking_indices = torch.randperm(self.num_actors, device=self.device)[:len(self.tracking_indices)]
@@ -448,6 +483,8 @@ class FBcprAgent(FBAgent):
         metrics = {'reward_step/' + name: torch.stack(values).mean() for name, values in step_rewards.items()}
         metrics.update({'reward_episode_sum/' + name: torch.stack(values).sum() for name, values in episode_rewards.items()})
         metrics.update(command_metrics)
+        metrics.update({'reference_reset/' + name: value.clone()
+                        for name, value in getattr(environment, 'reference_reset_statistics', {}).items()})
         metrics.update({
             'rollout/reward': block['reward'].mean(),
             'rollout/completed_episodes': reward.new_tensor(len(returns)),
@@ -496,23 +533,30 @@ class FBcprAgent(FBAgent):
         critic_state = torch.cat((state, history), -1)
         next_critic_state = torch.cat((next_state, next_history), -1)
         count, length = len(state), self.options['expert_sequence_length']
-        with torch.no_grad():
-            expert_sequence = self.experts.sample(count // length, length + 1)
-            expert_state = self.state_normalizer(expert_sequence[:, :-1].flatten(0, 1))
-            expert_next_state = self.state_normalizer(expert_sequence[:, 1:].flatten(0, 1))
-            expert_features = self.model.backward(expert_next_state).reshape(-1, length, self.options['latent_size'])
-            expert_command = project_task(expert_features.mean(1)).repeat_interleave(length, 0)
-        # Discriminator uses actual behavior commands, before learner relabeling.
-        metrics = self._discriminator_update(expert_state, expert_command, state, batch['command'])
+        metrics = {}
+        if not self.reference_reset_only:
+            with torch.no_grad():
+                expert_sequence = self.experts.sample(count // length, length + 1)
+                expert_state = self.state_normalizer(expert_sequence[:, :-1].flatten(0, 1))
+                expert_next_state = self.state_normalizer(expert_sequence[:, 1:].flatten(0, 1))
+                expert_features = self.model.backward(expert_next_state).reshape(-1, length, self.options['latent_size'])
+                expert_command = project_task(expert_features.mean(1)).repeat_interleave(length, 0)
+            # Discriminator uses actual behavior commands, before learner relabeling.
+            metrics = self._discriminator_update(expert_state, expert_command, state, batch['command'])
+        metrics['supervision/style_enabled'] = state.new_tensor(not self.reference_reset_only)
         with torch.no_grad():
             command = project_task(torch.randn(count, self.options['latent_size'], device=self.device))
             selector = torch.rand(count, 1, device=self.device)
             permutation = torch.randperm(count, device=self.device)
             goals = project_task(self.model.backward(next_state[permutation]))
-            command = torch.where(selector < .2, goals, command)
-            command = torch.where((selector >= .2) & (selector < .8), expert_command[permutation], command)
-            sources = torch.where(selector.squeeze(-1) < .2, 1,
-                                  torch.where(selector.squeeze(-1) < .8, 2, 0))
+            if self.reference_reset_only:
+                command = torch.where(selector < .5, goals, command)
+                sources = (selector.squeeze(-1) < .5).long()
+            else:
+                command = torch.where(selector < .2, goals, command)
+                command = torch.where((selector >= .2) & (selector < .8), expert_command[permutation], command)
+                sources = torch.where(selector.squeeze(-1) < .2, 1,
+                                      torch.where(selector.squeeze(-1) < .8, 2, 0))
             self._cache_commands(command, sources)
             relabel = torch.rand(count, 1, device=self.device) < self.options['relabel_probability']
             command = torch.where(relabel, command, batch['command'])
@@ -533,12 +577,13 @@ class FBcprAgent(FBAgent):
         representation_grad = self._synchronize_step(representation_loss, self.representation_optimizer, parameters)
         torch.backends.cuda.matmul.allow_tf32 = previous_tf32
         with torch.no_grad():
-            style_reward = self.model.discriminate(state, command).clamp(-16.118095, 16.118095)
             auxiliary_reward = self.reward_normalizer(batch['auxiliary_reward'].squeeze(-1))
-        for name, reward, optimizer in (
-            ('style', style_reward, self.style_optimizer),
-            ('auxiliary', auxiliary_reward, self.auxiliary_optimizer),
-        ):
+            critic_updates = []
+            if not self.reference_reset_only:
+                style_reward = self.model.discriminate(state, command).clamp(-16.118095, 16.118095)
+                critic_updates.append(('style', style_reward, self.style_optimizer))
+            critic_updates.append(('auxiliary', auxiliary_reward, self.auxiliary_optimizer))
+        for name, reward, optimizer in critic_updates:
             with torch.no_grad():
                 next_control = self._sample_action(next_history, next_state, command, self.options['target_noise_clip'])
                 target_value = getattr(self.target, name)(next_critic_state, next_control, command).min(0).values
@@ -550,7 +595,9 @@ class FBcprAgent(FBAgent):
             metrics['loss/' + name] = loss.detach()
             metrics['gradient/' + name] = gradient
             metrics['reward_train/' + name] = reward.mean().detach()
-        critics = list(self.model.forward_maps.parameters()) + list(self.model.style_maps.parameters()) + list(self.model.auxiliary_maps.parameters())
+        critics = list(self.model.forward_maps.parameters()) + list(self.model.auxiliary_maps.parameters())
+        if not self.reference_reset_only:
+            critics += list(self.model.style_maps.parameters())
         for parameter in critics:
             parameter.requires_grad_(False)
         actor_loss, q_fb, q_style, q_auxiliary = self._actor_objective(state, history, command)
@@ -597,6 +644,8 @@ class FBcprAgent(FBAgent):
             parameter.requires_grad_(True)
         with torch.no_grad():
             for name in ('forward_maps', 'backward', 'style_maps', 'auxiliary_maps'):
+                if self.reference_reset_only and name == 'style_maps':
+                    continue
                 tau = self.options['target_tau'] if name in ('forward_maps', 'backward') else self.options['critic_target_tau']
                 for target, online in zip(getattr(self.target, name).parameters(), getattr(self.model, name).parameters()):
                     target.lerp_(online, tau)

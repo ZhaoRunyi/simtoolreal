@@ -1,0 +1,14 @@
+defaults:
+  - SimToolRealFBV4
+  - _self_
+
+params:
+  config:
+    name: ${resolve_default:SimToolRealFBV14,${....experiment}}
+    fb:
+      reference_reset_only: true
+      tracking_fraction: 0.0
+      style_coefficient: 0.0
+      joint_limit_coefficient: 0.0
+      target_frames: 19120128
+      max_seconds: 21600

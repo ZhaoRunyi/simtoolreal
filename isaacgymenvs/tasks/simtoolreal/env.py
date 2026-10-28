@@ -3734,6 +3734,20 @@ class SimToolReal(VecTask):
             weights = bank["valid"][:, selected].T.float()
             available = weights.sum(-1) > 0
             selected = selected[available]
+            if getattr(self, "record_reference_reset_statistics", False):
+                if not hasattr(self, "reference_reset_statistics"):
+                    names = ("attempts", "restored", "unavailable", "fallback", "lifted_history",
+                             "physical_height_sum", "physically_above_15cm",
+                             "physically_at_or_below_5cm", "physically_between_5_and_15cm",
+                             "object_linear_speed_sum", "object_angular_speed_sum")
+                    self.reference_reset_statistics = {
+                        name: torch.zeros((), device=self.device) for name in names
+                    }
+                statistics = self.reference_reset_statistics
+                statistics["attempts"] += len(env_ids)
+                statistics["restored"] += len(selected)
+                statistics["unavailable"] += (~available).sum()
+                statistics["fallback"] += len(env_ids) - len(selected)
             if len(selected):
                 snapshots = torch.multinomial(weights[available], 1).squeeze(-1)
                 self.arm_hand_dof_pos[selected] = bank["joint_position"][snapshots, selected]
@@ -3747,6 +3761,16 @@ class SimToolReal(VecTask):
                 self.table_init_state[selected] = bank["table"][snapshots, selected]
                 self.object_init_state[selected, 2] = self.table_init_state[selected, 2] + self.cfg["env"]["tableObjectZOffset"]
                 self.lifted_object[selected] = bank["lifted"][snapshots, selected]
+                if getattr(self, "record_reference_reset_statistics", False):
+                    height = self.root_state_tensor[self.object_indices[selected], 2] - self.object_init_state[selected, 2]
+                    statistics["lifted_history"] += self.lifted_object[selected].sum()
+                    statistics["physical_height_sum"] += height.sum()
+                    statistics["physically_above_15cm"] += (height >= .15).sum()
+                    statistics["physically_at_or_below_5cm"] += (height <= .05).sum()
+                    statistics["physically_between_5_and_15cm"] += ((height > .05) & (height < .15)).sum()
+                    object_state = self.root_state_tensor[self.object_indices[selected]]
+                    statistics["object_linear_speed_sum"] += object_state[:, 7:10].norm(dim=-1).sum()
+                    statistics["object_angular_speed_sum"] += object_state[:, 10:13].norm(dim=-1).sum()
                 self.deferred_set_actor_root_state_tensor_indexed([self.object_indices[selected], self.table_indices[selected]])
 
 
