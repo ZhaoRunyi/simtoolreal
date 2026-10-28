@@ -1,0 +1,20 @@
+defaults:
+  - SimToolRealFBV4
+  - _self_
+
+params:
+  config:
+    name: ${resolve_default:SimToolRealFBV13,${....experiment}}
+    fb:
+      quality_reference_collection: false
+      quality_reference_path: null
+      quality_reference_sha256: null
+      original_reset_sha256: null
+      quality_training_approval_path: null
+      quality_training_approval_sha256: null
+      quality_collection_steps: 30000
+      quality_collection_seconds: 7200
+      quality_chunk_steps: 256
+      joint_limit_coefficient: 0.0
+      target_frames: 19120128
+      max_seconds: 21600

@@ -1795,6 +1795,16 @@ class SimToolReal(VecTask):
         )
         # Procedural URDFs live in a temporary directory. Retain only the XML
         # needed by the configured viewer environment before cleanup.
+        if self.cfg['env'].get('recordReferenceQuality', False):
+            from rl_games.algos_torch.fb_reference_quality import asset_manifest
+            self.reference_quality_assets = [
+                asset_manifest(Path(asset_root) / filename)
+                for filename in self.object_asset_files
+            ]
+            self.reference_quality_table_asset = asset_manifest(
+                Path(asset_root) / self.asset_files_dict['table']
+            )
+
         self._viewer_object_urdf_texts = [None] * len(self.object_asset_files)
         viewer_env_id = int(self.cfg["env"].get("capture_viewer_env_id", 0))
         if self.cfg["env"].get("capture_viewer", False):
@@ -2431,6 +2441,8 @@ class SimToolReal(VecTask):
         ones = torch.ones_like(self.reset_buf)
         zeros = torch.zeros_like(self.reset_buf)
 
+        if self.cfg['env'].get('recordReferenceQuality', False):
+            self.reference_quality_incoming_reset = self.reset_buf.clone()
         object_z_low = torch.where(self.object_pos[:, 2] < 0.1, ones, zeros)  # fall
         if self.max_consecutive_successes > 0:
             # Reset progress buffer if max_consecutive_successes > 0
@@ -2490,7 +2502,15 @@ class SimToolReal(VecTask):
             | hand_far_from_object
             | dropped
         )
+        if self.cfg['env'].get('recordReferenceQuality', False):
+            resets_before_extra = resets.clone()
         resets = self._extra_reset_rules(resets)
+        if self.cfg['env'].get('recordReferenceQuality', False):
+            self.reference_quality_failure_causes = torch.stack((
+                object_z_low, max_episode_length_reached, table_force_too_high,
+                hand_far_from_object, dropped,
+                resets & ~resets_before_extra,
+            ), dim=-1).bool()
 
         # Print resets when there is only one environment
         PRINT_RESET_REASONS = False
@@ -3486,6 +3506,11 @@ class SimToolReal(VecTask):
             self.root_state_tensor[obj_indices, :] = self.root_state_resets[
                 reset_buf_idxs[env_ids].cpu(), obj_indices.cpu() % rs_ofs, :
             ].to(self.device)
+
+        if tensor_reset and self.cfg['env'].get('recordReferenceQuality', False):
+            if not hasattr(self, 'reference_quality_noisy_initial'):
+                self.reference_quality_noisy_initial = torch.zeros_like(self.object_init_state)
+            self.reference_quality_noisy_initial[env_ids] = self.root_state_tensor[self.object_indices[env_ids]]
 
         # since we reset the object, we also should update distances between fingers and the object
         if tensor_reset:

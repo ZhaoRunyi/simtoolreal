@@ -143,31 +143,42 @@ class FBcprAgent(FBAgent):
     @torch.no_grad()
     def _prepare_experts(self):
         path = self.output_dir / ('expert.rank' + str(self.global_rank) + '.pt')
+        if self.options.get('quality_reference_path'):
+            reference = Path(self.options['quality_reference_path'].format(rank=self.global_rank))
+            from rl_games.algos_torch.fb_reference_audit import require_training_approval
+            require_training_approval(self.options, self.global_rank, reference, path)
+            expected = self.options['quality_reference_sha256'][self.global_rank]
+            if checkpoint_digest(reference) != expected:
+                raise ValueError('Quality reference cache identity changed')
+            if self.vec_env.env.cfg['env']['referenceResetProbability'] != 1.0:
+                raise ValueError('Quality learner must preserve actual v4 reset probability 1.0')
+            data = torch.load(reference, map_location=self.device)
+            if not data['report']['ready'] or data['report']['complete_fraction'] < .5:
+                raise ValueError('Quality reference budget/ratio not certified')
+            reset_identity = self.options['original_reset_sha256'][self.global_rank]
+            if checkpoint_digest(path) != reset_identity:
+                raise ValueError('Original reset bank identity changed')
+            original = torch.load(path, map_location=self.device)
+            self.experts = ExpertSequences(data['states'], data['valid'])
+            self.expert_report = data['report']
+            self.vec_env.env.reference_reset_bank = original['resets']
+            for length in (self.options['expert_sequence_length'], self.options['expert_sequence_length'] + 1,
+                           self.options['tracking_length']):
+                # Building starts must not consume the learner RNG.
+                invalid = (~self.experts.valid.bool()).long()
+                prefix = torch.cat((torch.zeros_like(invalid[:1]), invalid.cumsum(0)))
+                starts = ((prefix[length:] - prefix[:-length]) == 0).nonzero()
+                if not len(starts):
+                    raise ValueError('Certified references lack required window length ' + str(length))
+                self.experts.starts[length] = starts
+            return
         if path.exists():
             data = torch.load(path, map_location=self.device)
             self.experts = ExpertSequences(data['states'], data['valid'])
             self.expert_report = data['report']
             self.vec_env.env.reference_reset_bank = data['resets']
             return
-        teacher_root = Path(self.options['teacher_path'])
-        config = yaml.safe_load((teacher_root / 'config.yaml').read_text())
-        if config['task']['env']['obsList'] != self.vec_env.env.obs_list:
-            raise ValueError('Teacher observation ordering differs from the environment')
-        teacher_params = config['train']['params']
-        teacher = ModelBuilder().load(teacher_params).build({
-            'actions_num': self.action_size, 'input_shape': (self.observation_size + 1,),
-            'num_seqs': self.num_actors, 'value_size': 1,
-            'normalize_value': teacher_params['config']['normalize_value'],
-            'normalize_input': teacher_params['config']['normalize_input'],
-            'type': 'extra_param', 'coef_ids': torch.linspace(50, 0, 6, device=self.device),
-            'coef_id_idx': self.observation_size,
-        }).to(self.device).eval()
-        checkpoint = torch.load(teacher_root / 'model.pth', map_location=self.device)
-        if 0 in checkpoint:
-            checkpoint = checkpoint[0]
-        teacher.load_state_dict(checkpoint['model'])
-        if 'running_mean_std' in checkpoint:
-            teacher.running_mean_std.load_state_dict(checkpoint['running_mean_std'])
+        teacher, checkpoint, teacher_root = self._load_reference_policy()
         memory = [value.to(self.device) for value in teacher.get_default_rnn_state()]
         observations = {key: value.clone() for key, value in self.vec_env.reset().items()}
         selected = torch.randperm(self.num_actors, device=self.device)[:self.options['expert_environments']]
@@ -232,7 +243,33 @@ class FBcprAgent(FBAgent):
         del teacher, checkpoint, states, memory
         torch.cuda.empty_cache()
 
+    def _load_reference_policy(self):
+        teacher_root = Path(self.options['teacher_path'])
+        config = yaml.safe_load((teacher_root / 'config.yaml').read_text())
+        if config['task']['env']['obsList'] != self.vec_env.env.obs_list:
+            raise ValueError('Teacher observation ordering differs from the environment')
+        teacher_params = config['train']['params']
+        teacher = ModelBuilder().load(teacher_params).build({
+            'actions_num': self.action_size, 'input_shape': (self.observation_size + 1,),
+            'num_seqs': self.num_actors, 'value_size': 1,
+            'normalize_value': teacher_params['config']['normalize_value'],
+            'normalize_input': teacher_params['config']['normalize_input'],
+            'type': 'extra_param', 'coef_ids': torch.linspace(50, 0, 6, device=self.device),
+            'coef_id_idx': self.observation_size,
+        }).to(self.device).eval()
+        checkpoint = torch.load(teacher_root / 'model.pth', map_location=self.device)
+        if 0 in checkpoint:
+            checkpoint = checkpoint[0]
+        teacher.load_state_dict(checkpoint['model'])
+        if 'running_mean_std' in checkpoint:
+            teacher.running_mean_std.load_state_dict(checkpoint['running_mean_std'])
+        return teacher, checkpoint, teacher_root
+
     def train(self):
+        if self.options.get('quality_reference_collection', False):
+            from rl_games.algos_torch.fb_reference_quality import collect_quality_references
+            collect_quality_references(self)
+            return
         self._prepare_experts()
         return super().train()
 
