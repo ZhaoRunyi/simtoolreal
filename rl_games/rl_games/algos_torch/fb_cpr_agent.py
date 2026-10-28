@@ -7,6 +7,7 @@ from the published SimToolReal PPO teacher, not synthesized from object goals.
 """
 
 import copy
+import hashlib
 import json
 import math
 import time
@@ -28,7 +29,7 @@ from rl_games.algos_torch.fb_cpr_networks import (
 )
 from rl_games.algos_torch.fb_task_inference import (
     reward_components, infer_command_bank, checkpoint_digest,
-    select_phase_commands,
+    select_phase_commands, mixed_reward_commands,
 )
 from rl_games.algos_torch.model_builder import ModelBuilder
 
@@ -62,13 +63,41 @@ class FBcprAgent(FBAgent):
         self.z_size = 0
         self.experts = None
         self.expert_report = None
+        self.mixed_reward_bank = None
+        self.reward_sidecar = None
+        self.reward_sidecar_identity = None
+        self.reward_generator = None
+        if self.options.get('mixed_reward_commands', False):
+            self.reward_generator = torch.Generator(device=self.replay.device)
+            self.reward_generator.manual_seed(self.options['reward_sampling_seed'] + self.global_rank)
 
     @torch.no_grad()
     def save(self, filename, replay=False):
         super().save(filename, replay=replay)
-        if not replay or not self.options.get('record_inference_pool', False):
-            return
-        self._save_inference_pool(filename)
+        if replay and self.options.get('mixed_reward_commands', False):
+            path = Path(filename).with_name(Path(filename).stem + '.rank' + str(self.global_rank) + '.commands.pt')
+            payload = {
+                'schema_version': 2,
+                'frame': self.frame, 'optimizer_step': self.optimizer_step, 'rank': self.global_rank,
+                'world_size': self.world_size, 'bank': self.mixed_reward_bank,
+                'sidecar_identity': self.reward_sidecar_identity,
+                'generator_state': self.reward_generator.get_state(),
+                'z_buffer': self.z_buffer, 'z_source_buffer': self.z_source_buffer,
+                'z_position': self.z_position, 'z_size': self.z_size,
+                'model_sha256': checkpoint_digest(filename),
+                'replay_identity': self._reward_replay_identity(filename),
+                'replay_state': self._reward_replay_state(),
+                'warmup_complete': self.replay.size >= self.options['warmup_blocks'],
+                'rollout_step': self.rollout_step,
+                'resume_semantics': 'same replay file; fresh physical episodes; parent restores per-rank global RNG',
+            }
+            temporary = path.with_suffix('.tmp')
+            torch.save(payload, temporary)
+            temporary.replace(path)
+            if self.world_size > 1:
+                distributed.barrier()
+        if replay and self.options.get('record_inference_pool', False):
+            self._save_inference_pool(filename)
 
     @torch.no_grad()
     def _save_inference_pool(self, filename):
@@ -149,25 +178,7 @@ class FBcprAgent(FBAgent):
             self.expert_report = data['report']
             self.vec_env.env.reference_reset_bank = data['resets']
             return
-        teacher_root = Path(self.options['teacher_path'])
-        config = yaml.safe_load((teacher_root / 'config.yaml').read_text())
-        if config['task']['env']['obsList'] != self.vec_env.env.obs_list:
-            raise ValueError('Teacher observation ordering differs from the environment')
-        teacher_params = config['train']['params']
-        teacher = ModelBuilder().load(teacher_params).build({
-            'actions_num': self.action_size, 'input_shape': (self.observation_size + 1,),
-            'num_seqs': self.num_actors, 'value_size': 1,
-            'normalize_value': teacher_params['config']['normalize_value'],
-            'normalize_input': teacher_params['config']['normalize_input'],
-            'type': 'extra_param', 'coef_ids': torch.linspace(50, 0, 6, device=self.device),
-            'coef_id_idx': self.observation_size,
-        }).to(self.device).eval()
-        checkpoint = torch.load(teacher_root / 'model.pth', map_location=self.device)
-        if 0 in checkpoint:
-            checkpoint = checkpoint[0]
-        teacher.load_state_dict(checkpoint['model'])
-        if 'running_mean_std' in checkpoint:
-            teacher.running_mean_std.load_state_dict(checkpoint['running_mean_std'])
+        teacher, checkpoint, teacher_root = self._load_reference_policy()
         memory = [value.to(self.device) for value in teacher.get_default_rnn_state()]
         observations = {key: value.clone() for key, value in self.vec_env.reset().items()}
         selected = torch.randperm(self.num_actors, device=self.device)[:self.options['expert_environments']]
@@ -232,7 +243,302 @@ class FBcprAgent(FBAgent):
         del teacher, checkpoint, states, memory
         torch.cuda.empty_cache()
 
+    def _load_reference_policy(self):
+        teacher_root = Path(self.options['teacher_path'])
+        config = yaml.safe_load((teacher_root / 'config.yaml').read_text())
+        if config['task']['env']['obsList'] != self.vec_env.env.obs_list:
+            raise ValueError('Teacher observation ordering differs from the environment')
+        teacher_params = config['train']['params']
+        teacher = ModelBuilder().load(teacher_params).build({
+            'actions_num': self.action_size, 'input_shape': (self.observation_size + 1,),
+            'num_seqs': self.num_actors, 'value_size': 1,
+            'normalize_value': teacher_params['config']['normalize_value'],
+            'normalize_input': teacher_params['config']['normalize_input'],
+            'type': 'extra_param', 'coef_ids': torch.linspace(50, 0, 6, device=self.device),
+            'coef_id_idx': self.observation_size,
+        }).to(self.device).eval()
+        checkpoint = torch.load(teacher_root / 'model.pth', map_location=self.device)
+        if 0 in checkpoint:
+            checkpoint = checkpoint[0]
+        teacher.load_state_dict(checkpoint['model'])
+        if 'running_mean_std' in checkpoint:
+            teacher.running_mean_std.load_state_dict(checkpoint['running_mean_std'])
+        return teacher, checkpoint, teacher_root
+
+    def _command_source_names(self):
+        if self.options.get('mixed_reward_commands', False):
+            return ('random', 'replay_goal', 'reward_full', 'reward_phased')
+        return ('random', 'replay_goal', 'expert_mean', 'expert_sequence')
+
+    def _reward_replay_identity(self, filename):
+        path = Path(filename)
+        path = path.with_name(path.stem + '.rank' + str(self.global_rank) + '.replay.pt')
+        metadata = path.stat()
+        # This identity deliberately rejects copied/replaced shards. It is not
+        # a content hash or a portable checkpoint manifest.
+        return {'device': metadata.st_dev, 'inode': metadata.st_ino,
+                'size': metadata.st_size, 'mtime_ns': metadata.st_mtime_ns,
+                'ctime_ns': metadata.st_ctime_ns}
+
+    def _reward_replay_state(self):
+        return {'size': self.replay.size, 'position': self.replay.position,
+                'next_time': getattr(self.replay, 'next_time', None),
+                'fields': sorted(self.replay.storage or {}),
+                'capacity': self.replay.capacity}
+
+    def _reward_gate(self, error, phase):
+        success = torch.tensor(int(error is None), device=self.device)
+        if self.world_size > 1:
+            distributed.all_reduce(success, op=distributed.ReduceOp.MIN)
+        if not success.item():
+            if error is not None:
+                raise error
+            raise RuntimeError('Another rank failed ' + phase)
+
+    @staticmethod
+    def _reward_json_digest(value):
+        return hashlib.sha256(json.dumps(value, sort_keys=True, allow_nan=False).encode()).hexdigest()
+
+    def _reward_scene_mapping(self):
+        environment = self.vec_env.env
+        # Procedural URDF directories are process-local and already deleted
+        # after scene creation. Their filenames encode sampled geometry and
+        # densities; bind their ordered names, scales and generator source.
+        procedural = environment.cfg['env'].get('objectName') == 'handle_head_primitives'
+        assets = [Path(path).name if procedural else str(path) for path in environment.object_asset_files]
+        source_root = Path(__file__).resolve().parents[3] / 'isaacgymenvs/tasks/simtoolreal'
+        return {'asset_files': assets,
+                'asset_index': (torch.arange(self.num_actors) % len(assets)).tolist(),
+                'object_scales': environment.object_scales.cpu().tolist(),
+                'generator_source_sha256': {name: checkpoint_digest(source_root / name) for name in
+                                            ('env.py', 'generate_objects.py', 'object_size_distributions.py')}}
+
+    @torch.no_grad()
+    def _collect_reward_sidecar(self):
+        """Independent PPO process: retain actual rewards and terminal transitions."""
+        path = self.output_dir / ('reward_sidecar.rank' + str(self.global_rank) + '.pt')
+        if path.exists():
+            raise FileExistsError('Preserve existing PPO sidecar; validate it before reuse')
+        teacher, checkpoint, teacher_root = self._load_reference_policy()
+        environment = self.vec_env.env
+        if (self.num_actors, self.options['expert_steps'], self.options['expert_environments']) != (6144, 1500, 256):
+            raise ValueError('PPO reward collection requires 6144 scenes, 1500 steps and 256 fixed streams per rank')
+        if getattr(environment, 'reference_reset_bank', None) is not None:
+            raise ValueError('PPO reward collection must begin without a reference reset bank')
+        from omegaconf import OmegaConf
+        configuration = environment.cfg
+        if OmegaConf.is_config(configuration):
+            configuration = OmegaConf.to_container(configuration, resolve=True)
+        configuration = copy.deepcopy(configuration)
+        initial_curriculum = {name: getattr(environment, name) for name in
+                              ('success_tolerance', 'frame_since_restart', 'last_curriculum_update')}
+        if (initial_curriculum['frame_since_restart'] != 0
+                or initial_curriculum['last_curriculum_update'] != 0
+                or initial_curriculum['success_tolerance'] != environment.initial_tolerance
+                or configuration.get('test', False)
+                or configuration['env'].get('useFixedGoalStates', False)
+                or configuration['env'].get('evalSuccessTolerance') is not None):
+            raise ValueError('PPO reward collection requires original training curriculum and goals')
+        scene_mapping = self._reward_scene_mapping()
+        collection_seed = torch.initial_seed()
+        memory = [value.to(self.device) for value in teacher.get_default_rnn_state()]
+        observations = {key: value.clone() for key, value in self.vec_env.reset().items()}
+        selected = torch.randperm(self.num_actors, device=self.device)[:self.options['expert_environments']]
+        reset_before = torch.ones(self.num_actors, dtype=torch.bool, device=self.device)
+        episode = torch.zeros(self.num_actors, dtype=torch.long, device=self.device)
+        records = []
+        started = time.monotonic()
+        for step in range(self.options['expert_steps']):
+            inputs = torch.cat((observations['obs'], observations['obs'].new_full((self.num_actors, 1), 50.)), -1)
+            result = teacher({'is_train': False, 'prev_actions': None, 'obs': inputs, 'rnn_states': memory})
+            action, memory = result['mus'].clamp(-1, 1), result['rnn_states']
+            state = observations['states'][selected].clone()
+            goal_reset_before = environment.reset_goal_buf[selected].bool().clone()
+            next_observations, reward, done, info = self.vec_env.step(action)
+            done = done.bool()
+            episode += reset_before.long()
+            components = torch.stack([info['episode_cumulative'][name] for name in reward_components], -1)
+            if not torch.allclose(components.sum(-1), reward.reshape(-1), atol=1e-5, rtol=1e-5):
+                raise ValueError('PPO sidecar component sum does not equal original reward')
+            row = {
+                'state': state, 'next_state': next_observations['states'][selected].clone(),
+                'action': action[selected].clone(), 'reward': reward.reshape(-1)[selected].clone(),
+                'reward_components': components[selected].clone(),
+                'valid': (~reset_before)[selected].clone(), 'reset_before': reset_before[selected].clone(),
+                'done': done[selected].clone(), 'discount': self.config['gamma'] * (~done[selected]).float(),
+                'episode': episode[selected].clone(), 'goal_reset_before': goal_reset_before,
+                'goal_reset_after': environment.reset_goal_buf[selected].bool().clone(),
+                'source_step': torch.full_like(selected, step), 'source_environment': selected.clone(),
+                'goal': environment.goal_states[selected].clone(),
+                'object': environment.root_state_tensor[environment.object_indices[selected]].clone(),
+                'object_initial': environment.object_init_state[selected].clone(),
+                'table': environment.root_state_tensor[environment.table_indices[selected]].clone(),
+                'lifted': environment.lifted_object[selected].clone(),
+                'successes': environment.successes[selected].clone(),
+                'success_tolerance': state.new_full((len(selected),), environment.success_tolerance),
+            }
+            records.append({name: value.cpu() for name, value in row.items()})
+            for value in memory:
+                value[:, done] = 0
+            reset_before = done
+            observations = {key: value.clone() for key, value in next_observations.items()}
+            if step % 100 == 0:
+                self._status('reward_collection', collection_step=step)
+        payload = {
+            'schema_version': 2, 'rank': self.global_rank, 'world_size': self.world_size,
+            'reward_names': list(reward_components), 'selected_environments': selected.cpu(),
+            'steps': self.options['expert_steps'], 'simulation_environments': self.num_actors,
+            'state_size': self.state_size, 'collection_environment_config': configuration,
+            'collection_environment_sha256': self._reward_json_digest(configuration),
+            'seed': collection_seed, 'initial_curriculum': initial_curriculum,
+            'scene_mapping': scene_mapping, 'scene_mapping_sha256': self._reward_json_digest(scene_mapping),
+            'simulation_transitions': self.num_actors * self.options['expert_steps'],
+            'stored_transitions': len(selected) * self.options['expert_steps'],
+            'teacher_sha256': checkpoint_digest(teacher_root / 'model.pth'),
+            'teacher_config_sha256': checkpoint_digest(teacher_root / 'config.yaml'),
+            'seconds': time.monotonic() - started,
+            'timing': 'state/action before step; next_state, components, goal and object after reward; reset_before excluded, terminal retained',
+            'rows': {name: torch.stack([row[name] for row in records]) for name in records[0]},
+        }
+        temporary = path.with_suffix('.tmp')
+        torch.save(payload, temporary)
+        temporary.replace(path)
+        report = {name: value for name, value in payload.items() if name not in ('rows', 'selected_environments', 'collection_environment_config', 'scene_mapping')}
+        report.update(sha256=checkpoint_digest(path), valid_transitions=int(payload['rows']['valid'].sum()),
+                      terminal_valid_transitions=int((payload['rows']['valid'] & payload['rows']['done']).sum()))
+        path.with_suffix('.json').write_text(json.dumps(report, indent=2, allow_nan=False))
+        self._status('reward_collection_complete', collection_steps=payload['steps'])
+
+    def _load_reward_sidecar(self):
+        path = Path(self.options['reward_sidecar_path'].format(rank=self.global_rank))
+        expected = self.options['reward_sidecar_sha256'][self.global_rank]
+        actual = checkpoint_digest(path)
+        if actual != expected:
+            raise ValueError('PPO reward sidecar identity changed')
+        data = torch.load(path, map_location='cpu')
+        if (data['schema_version'] != 2 or data['rank'] != self.global_rank
+                or data['world_size'] != self.world_size or data['state_size'] != self.state_size
+                or tuple(data['reward_names']) != reward_components):
+            raise ValueError('PPO reward sidecar schema/rank mismatch')
+        teacher_root = Path(self.options['teacher_path'])
+        if (data['teacher_sha256'] != checkpoint_digest(teacher_root / 'model.pth')
+                or data['teacher_config_sha256'] != checkpoint_digest(teacher_root / 'config.yaml')):
+            raise ValueError('PPO reward sidecar teacher mismatch')
+        expected_environment = self.options['reward_sidecar_environment_sha256'][self.global_rank]
+        if (data['collection_environment_sha256'] != expected_environment
+                or self._reward_json_digest(data['collection_environment_config']) != expected_environment
+                or data['seed'] != self.options['reward_sidecar_seed'][self.global_rank]):
+            raise ValueError('PPO reward sidecar collection configuration or seed mismatch')
+        if (self._reward_json_digest(data['scene_mapping']) != data['scene_mapping_sha256']
+                or data['scene_mapping'] != self._reward_scene_mapping()):
+            raise ValueError('PPO reward sidecar scene mapping mismatch')
+        if (data['steps'], data['simulation_environments'], len(data['selected_environments']),
+                data['simulation_transitions'], data['stored_transitions']) != (1500, 6144, 256, 9216000, 384000):
+            raise ValueError('PPO reward sidecar collection budget mismatch')
+        curriculum = data['initial_curriculum']
+        if (curriculum['frame_since_restart'] != 0 or curriculum['last_curriculum_update'] != 0
+                or curriculum['success_tolerance'] != self.vec_env.env.initial_tolerance):
+            raise ValueError('PPO reward sidecar initial curriculum mismatch')
+        valid = data['rows']['valid'].bool()
+        rows = data['rows']
+        if (valid.shape != (1500, 256) or not valid.any()
+                or not torch.equal(valid, ~rows['reset_before'].bool())
+                or not torch.equal(rows['reset_before'][1:], rows['done'][:-1])
+                or not rows['reset_before'][0].all()
+                or not torch.equal(rows['source_step'], torch.arange(1500)[:, None].expand(1500, 256))
+                or not torch.equal(rows['source_environment'], data['selected_environments'].expand(1500, 256))
+                or data['selected_environments'].unique().numel() != 256
+                or data['selected_environments'].min() < 0 or data['selected_environments'].max() >= 6144
+                or not torch.allclose(rows['reward_components'].sum(-1), rows['reward'], atol=1e-5, rtol=1e-5)
+                or not torch.allclose(rows['discount'], self.config['gamma'] * (~rows['done'].bool()).float())):
+            raise ValueError('PPO reward sidecar valid population is not replay-compatible')
+        self.reward_sidecar = {name: data['rows'][name][valid].to(self.device)
+                               for name in ('next_state', 'reward_components')}
+        if not all(torch.isfinite(value).all() for value in self.reward_sidecar.values()):
+            raise ValueError('Nonfinite PPO reward sidecar')
+        self.reward_sidecar_rows = valid.nonzero()
+        self.reward_sidecar_identity = {'path': str(path.resolve()), 'sha256': actual,
+                                       'population': int(valid.sum()), 'rank': self.global_rank,
+                                       'environment_sha256': expected_environment, 'seed': data['seed'],
+                                       'scene_mapping_sha256': data['scene_mapping_sha256']}
+
+    @torch.no_grad()
+    def _refresh_mixed_reward_bank(self):
+        count = self.options['reward_samples_per_source']
+        evidence = {'frame': self.frame, 'optimizer_step': self.optimizer_step,
+                    'rank': self.global_rank, 'sidecar_identity': self.reward_sidecar_identity}
+        error = None
+        previous_tf32 = torch.backends.cuda.matmul.allow_tf32
+        try:
+            if self.state_normalizer.training:
+                raise ValueError('Reward inference requires a frozen normalizer')
+            if not isinstance(self.replay, TemporalReplay):
+                raise ValueError('Mixed reward commands require the original v4 temporal replay')
+            indices = torch.randint(len(self.reward_sidecar['next_state']), (count,),
+                                    generator=self.reward_generator, device=self.replay.device)
+            blocks, rows = self.replay._indices(count, generator=self.reward_generator)
+            online = self.replay._gather(blocks, rows)
+            evidence.update(ppo_indices=indices, online_blocks=blocks, online_rows=rows,
+                            online_time_ids=self.replay.time_ids[blocks])
+            if hasattr(self, 'reward_sidecar_rows'):
+                evidence['ppo_step_stream'] = self.reward_sidecar_rows[indices]
+            indices = indices.to(self.device)
+            states = torch.cat((self.reward_sidecar['next_state'][indices], online['next_state']))
+            components = torch.cat((self.reward_sidecar['reward_components'][indices], online['reward_components']))
+            features = self.model.backward(self.state_normalizer(states))
+            evidence.update(states=states, components=components, features=features)
+            torch.backends.cuda.matmul.allow_tf32 = False
+            bank, statistics, valid = mixed_reward_commands(features, components, count, evidence)
+            evidence.update(statistics=statistics, local_valid=bool(valid))
+            if not valid.item():
+                error = FloatingPointError('Mixed reward bank lacks finite positive task evidence')
+        except Exception as caught:
+            error = caught
+        finally:
+            torch.backends.cuda.matmul.allow_tf32 = previous_tf32
+        globally_valid = torch.tensor(int(error is None), device=self.device)
+        if self.world_size > 1:
+            distributed.all_reduce(globally_valid, op=distributed.ReduceOp.MIN)
+        if not globally_valid.item():
+            evidence['error'] = repr(error)
+            path = self.output_dir / ('reward_bank_failure.rank' + str(self.global_rank) + '.pt')
+            torch.save(evidence, path)
+            if error is not None:
+                raise error
+            raise FloatingPointError('Mixed reward bank failed on another rank')
+        if self.mixed_reward_bank is not None:
+            cosines = functional.cosine_similarity(bank, self.mixed_reward_bank['commands'], dim=-1)
+            for index, name in enumerate(('grasp_lift', 'track', 'full')):
+                statistics[name + '/previous_cosine'] = cosines[index]
+                statistics[name + '/previous_angle_radians'] = cosines[index].clamp(-1, 1).acos()
+        self.mixed_reward_bank = {
+            'commands': bank, 'frame': self.frame, 'before_optimizer_step': self.optimizer_step,
+            'backward_optimizer_step': self.optimizer_step,
+            'normalizer_online_updates': 2 * (self.optimizer_step + 1),
+            'sidecar_identity': self.reward_sidecar_identity,
+            'ppo_contribution': evidence['ppo_contribution'],
+            'online_contribution': evidence['online_contribution'],
+            'ppo_indices': evidence['ppo_indices'], 'online_blocks': blocks,
+            'online_rows': rows, 'online_time_ids': self.replay.time_ids[blocks],
+        }
+        return {'reward_bank/' + name: value for name, value in statistics.items()}
+
     def train(self):
+        if self.options.get('reference_reward_collection', False):
+            error = None
+            try:
+                self._collect_reward_sidecar()
+            except Exception as caught:
+                error = caught
+            self._reward_gate(error, 'reward sidecar collection')
+            return
+        if self.options.get('mixed_reward_commands', False):
+            error = None
+            try:
+                self._load_reward_sidecar()
+            except Exception as caught:
+                error = caught
+            self._reward_gate(error, 'reward sidecar loading')
         self._prepare_experts()
         return super().train()
 
@@ -257,7 +563,41 @@ class FBcprAgent(FBAgent):
         self.z_position = (self.z_position + len(commands)) % len(self.z_buffer)
         self.z_size = min(len(self.z_buffer), self.z_size + len(commands))
 
-    def _initialize_rollout(self):
+    def _initialize_rollout(self, restore_training=True):
+        resumed_rollout_step = 0
+        if restore_training and self.options.get('mixed_reward_commands', False) and self.last_checkpoint is not None:
+            error = None
+            try:
+                path = self.last_checkpoint.with_name(self.last_checkpoint.stem + '.rank' + str(self.global_rank) + '.commands.pt')
+                saved = torch.load(path, map_location=self.device)
+                expected = (self.frame, self.optimizer_step, self.global_rank, self.world_size)
+                actual = tuple(saved[name] for name in ('frame', 'optimizer_step', 'rank', 'world_size'))
+                if (saved['schema_version'] != 2 or actual != expected
+                        or saved['sidecar_identity'] != self.reward_sidecar_identity
+                        or saved['model_sha256'] != checkpoint_digest(self.last_checkpoint)
+                        or saved['replay_identity'] != self._reward_replay_identity(self.last_checkpoint)
+                        or saved['warmup_complete'] != (saved['replay_state']['size'] >= self.options['warmup_blocks'])):
+                    raise ValueError('Mixed reward snapshot does not match model/replay/rank/sidecar/warmup')
+                bank = saved['bank']
+                if self.optimizer_step == 0:
+                    if bank is not None:
+                        raise ValueError('Warmup checkpoint cannot contain a reward bank')
+                elif (bank is None or bank['before_optimizer_step'] != self.optimizer_step - 1
+                      or bank['backward_optimizer_step'] != self.optimizer_step - 1
+                      or bank['normalizer_online_updates'] != 2 * self.optimizer_step
+                      or bank['frame'] != self.frame or bank['sidecar_identity'] != self.reward_sidecar_identity
+                      or bank['commands'].shape != (3, self.options['latent_size'])
+                      or not torch.isfinite(bank['commands']).all()):
+                    raise ValueError('Mixed reward bank version does not match the saved learner')
+                self.mixed_reward_bank = bank
+                self.reward_generator.set_state(saved['generator_state'].cpu())
+                for name in ('z_buffer', 'z_source_buffer', 'z_position', 'z_size'):
+                    setattr(self, name, saved[name])
+                self.reward_resume_replay_state = saved['replay_state']
+                resumed_rollout_step = saved['rollout_step']
+            except Exception as caught:
+                error = caught
+            self._reward_gate(error, 'reward command restoration')
         self.vec_env.env.reset_buf.fill_(1)
         self.observations = {key: value.clone() for key, value in self.vec_env.reset().items()}
         self.history = torch.zeros(self.num_actors, self.options['history_steps'], self.observation_size, device=self.device)
@@ -274,7 +614,7 @@ class FBcprAgent(FBAgent):
         self.previous_block = self.previous_initial_state = None
         self.tracking_indices = torch.arange(int(self.num_actors * self.options['tracking_fraction']), device=self.device)
         self.tracking_prompts = None
-        self.rollout_step = 0
+        self.rollout_step = resumed_rollout_step
 
     def _history_input(self, history, previous_action):
         normalized = self.observation_normalizer(history.reshape(-1, self.observation_size)).reshape(history.shape[0], -1)
@@ -295,7 +635,7 @@ class FBcprAgent(FBAgent):
                                      + self.options['auxiliary_coefficient'] * q_auxiliary.mean())
         return loss, q_fb, q_style, q_auxiliary
 
-    def _actor_gradient_probe(self, q_fb, q_style, q_auxiliary):
+    def _actor_gradient_probe(self, q_fb, q_style, q_auxiliary, command_sources=None):
         """Measure weighted branch gradients on the actual sampled actor graph.
 
         This does not populate .grad, draw samples, or step an optimizer. Average
@@ -308,6 +648,13 @@ class FBcprAgent(FBAgent):
             'style': -scale * self.options['style_coefficient'] * q_style.mean(),
             'auxiliary': -scale * self.options['auxiliary_coefficient'] * q_auxiliary.mean(),
         }
+        if command_sources is not None:
+            for source, name in enumerate(self._command_source_names()):
+                mask = (command_sources == source).to(q_fb.dtype)
+                # Contributions to the actual global-batch objective; empty
+                # sources contribute exactly zero, without drawing new actions.
+                losses['fb_' + name] = -(q_fb * mask).mean()
+                losses['style_' + name] = -scale * self.options['style_coefficient'] * (q_style * mask).mean()
         vectors = {}
         for name, loss in losses.items():
             gradients = torch.autograd.grad(loss, parameters, retain_graph=True)
@@ -334,25 +681,50 @@ class FBcprAgent(FBAgent):
         for left, right in (('fb', 'style'), ('fb', 'auxiliary'), ('style', 'auxiliary')):
             metrics['actor_grad/' + left + '_' + right + '_cosine'] = functional.cosine_similarity(
                 vectors[left], vectors[right], dim=0)
+        for source in self._command_source_names():
+            if 'fb_' + source in vectors:
+                metrics['actor_grad/' + source + '_fb_style_cosine'] = functional.cosine_similarity(
+                    vectors['fb_' + source], vectors['style_' + source], dim=0)
         metrics['actor_grad/fb_total_cosine'] = functional.cosine_similarity(
             vectors['fb'], clipped_gradient, dim=0)
         return metrics
 
     def _log(self, metrics):
         # Probes need not coincide with log_interval; preserve their exact step.
-        metrics = {**metrics, **getattr(self, 'pending_actor_gradient_metrics', {})}
+        metrics = {**metrics, **getattr(self, 'pending_actor_gradient_metrics', {}),
+                   **getattr(self, 'pending_command_diagnostics', {})}
         result = super()._log(metrics)
         self.pending_actor_gradient_metrics = {}
+        self.pending_command_diagnostics = {}
         return result
 
     @torch.no_grad()
     def _rollout_prompts(self):
         refresh = self.reset_before | (self.command_age >= self.options['command_steps'])
         candidates = self._sample_commands(self.num_actors)
+        length = self.options['tracking_length']
+        if self.options.get('mixed_reward_commands', False):
+            if not hasattr(self, 'held_command'):
+                self.held_command = self.rollout_command.clone()
+                self.held_command_source = self.rollout_command_source.clone()
+            self.held_command = torch.where(refresh[:, None], candidates, self.held_command)
+            self.held_command_source = torch.where(refresh, self.sampled_command_source, self.held_command_source)
+            self.rollout_command = self.held_command.clone()
+            self.rollout_command_source = self.held_command_source.clone()
+            self.command_age = torch.where(refresh, 0, self.command_age)
+            if self.mixed_reward_bank is None:
+                return
+            if self.rollout_step % length == 0 or self.tracking_prompts is None:
+                self.tracking_indices = torch.randperm(self.num_actors, device=self.device)[:len(self.tracking_indices)]
+                self.tracking_prompts = True
+            lifted = self.observations['states'][:, self.options['lifted_state_index']].bool()
+            commands = select_phase_commands(self.mixed_reward_bank['commands'], lifted, 'phased')
+            self.rollout_command[self.tracking_indices] = commands[self.tracking_indices]
+            self.rollout_command_source[self.tracking_indices] = 3
+            return
         self.rollout_command = torch.where(refresh[:, None], candidates, self.rollout_command)
         self.rollout_command_source = torch.where(refresh, self.sampled_command_source, self.rollout_command_source)
         self.command_age = torch.where(refresh, 0, self.command_age)
-        length = self.options['tracking_length']
         if self.rollout_step % length == 0:
             self.tracking_indices = torch.randperm(self.num_actors, device=self.device)[:len(self.tracking_indices)]
             experts = self.experts.sample(len(self.tracking_indices), length)
@@ -384,6 +756,12 @@ class FBcprAgent(FBAgent):
 
     @torch.no_grad()
     def collect(self):
+        if hasattr(self, 'reward_resume_replay_state'):
+            error = None
+            if self._reward_replay_state() != self.reward_resume_replay_state:
+                error = ValueError('Loaded replay logical counters/schema differ from command snapshot')
+            self._reward_gate(error, 'loaded replay binding')
+            del self.reward_resume_replay_state
         records, episode_returns = [], []
         step_rewards, episode_rewards = {}, {}
         command_metrics = {}
@@ -414,12 +792,14 @@ class FBcprAgent(FBAgent):
                 'discount': self.config['gamma'] * (~done).float().unsqueeze(-1),
                 'valid': (~self.reset_before).unsqueeze(-1).clone(),
             })
-            if self.options.get('record_inference_pool', False):
+            if self.options.get('mixed_reward_commands', False):
+                records[-1]['command_source'] = self.rollout_command_source[:, None].clone()
+            if self.options.get('record_inference_pool', False) or self.options.get('mixed_reward_commands', False):
                 records[-1]['reward_components'] = torch.stack(
                     [info['episode_cumulative'][name] for name in reward_components], dim=-1
                 ).clone()
             if self.options.get('log_command_sources', False):
-                for source, name in enumerate(('random', 'replay_goal', 'expert_mean', 'expert_sequence')):
+                for source, name in enumerate(self._command_source_names()):
                     mask = (self.rollout_command_source == source) & ~self.reset_before
                     count_name = 'command_count/' + name
                     command_metrics[count_name] = command_metrics.get(count_name, 0) + mask.sum()
@@ -465,9 +845,39 @@ class FBcprAgent(FBAgent):
         })
         return metrics
 
-    def _discriminator_update(self, expert_state, expert_command, state, rollout_command):
+    def _discriminator_update(self, expert_state, expert_command, state, rollout_command, rollout_sources=None):
         real = self.model.discriminate(expert_state, expert_command)
         fake = self.model.discriminate(state, rollout_command)
+        diagnostics = {}
+        if rollout_sources is not None:
+            with torch.no_grad():
+                diagnostics['discriminator_source/expert_positive/count'] = real.new_tensor(real.numel())
+                diagnostics['discriminator_source/expert_positive/logit_sum'] = real.sum()
+                diagnostics['discriminator_source/expert_positive/saturated_count'] = (real.abs() > math.log(99)).float().sum()
+                for source, name in enumerate(self._command_source_names()):
+                    mask = rollout_sources == source
+                    prefix = 'discriminator_source/' + name + '/'
+                    diagnostics[prefix + 'count'] = mask.float().sum()
+                    diagnostics[prefix + 'logit_sum'] = fake[mask].sum()
+                    diagnostics[prefix + 'saturated_count'] = (fake[mask].abs() > math.log(99)).float().sum()
+                # Same states, fixed replacement commands, no new sampling.
+                replacements = [('expert_mean', expert_command)] + [
+                    (name, self.mixed_reward_bank['commands'][index].expand_as(rollout_command))
+                    for index, name in enumerate(('reward_grasp_lift', 'reward_track', 'reward_full'))]
+                probe_every = self.options.get('actor_gradient_probe_every', 0)
+                if probe_every <= 0 or self.optimizer_step % probe_every:
+                    replacements = []
+                for name, replacement in replacements:
+                    swapped = self.model.discriminate(state, replacement)
+                    prefix = 'discriminator_fixed_state_swap/' + name + '/'
+                    diagnostics[prefix + 'logit'] = swapped.mean()
+                    diagnostics[prefix + 'delta_from_behavior'] = (swapped - fake).mean()
+                    diagnostics[prefix + 'saturated_fraction'] = (swapped.abs() > math.log(99)).float().mean()
+                if replacements:
+                    self.pending_command_diagnostics = {
+                        name: value for name, value in diagnostics.items()
+                        if name.startswith('discriminator_fixed_state_swap/')}
+                    self.pending_command_diagnostics['discriminator_fixed_state_swap/before_optimizer_step'] = real.new_tensor(self.optimizer_step)
         alpha = torch.rand(len(state), 1, device=self.device)
         mixed_state = (alpha * expert_state + (1 - alpha) * state).requires_grad_(True)
         mixed_command = (alpha * expert_command + (1 - alpha) * rollout_command).requires_grad_(True)
@@ -477,7 +887,8 @@ class FBcprAgent(FBAgent):
         loss = (functional.softplus(-real) + functional.softplus(fake)).mean() + self.options['discriminator_penalty'] * penalty
         self._synchronize_step(loss, self.discriminator_optimizer, self.model.discriminator.parameters())
         return {'loss/discriminator': loss.detach(), 'loss/discriminator_gradient_penalty': penalty.detach(),
-                'discriminator/expert_logit': real.detach().mean(), 'discriminator/online_logit': fake.detach().mean()}
+                'discriminator/expert_logit': real.detach().mean(), 'discriminator/online_logit': fake.detach().mean(),
+                **diagnostics}
 
     def update(self):
         batch = self.replay.sample(self.config['minibatch_size'])
@@ -496,6 +907,9 @@ class FBcprAgent(FBAgent):
         critic_state = torch.cat((state, history), -1)
         next_critic_state = torch.cat((next_state, next_history), -1)
         count, length = len(state), self.options['expert_sequence_length']
+        mixed_metrics = {}
+        if self.options.get('mixed_reward_commands', False):
+            mixed_metrics = self._refresh_mixed_reward_bank()
         with torch.no_grad():
             expert_sequence = self.experts.sample(count // length, length + 1)
             expert_state = self.state_normalizer(expert_sequence[:, :-1].flatten(0, 1))
@@ -503,19 +917,25 @@ class FBcprAgent(FBAgent):
             expert_features = self.model.backward(expert_next_state).reshape(-1, length, self.options['latent_size'])
             expert_command = project_task(expert_features.mean(1)).repeat_interleave(length, 0)
         # Discriminator uses actual behavior commands, before learner relabeling.
-        metrics = self._discriminator_update(expert_state, expert_command, state, batch['command'])
+        rollout_sources = batch['command_source'].squeeze(-1).long() if self.options.get('mixed_reward_commands', False) else None
+        metrics = self._discriminator_update(expert_state, expert_command, state, batch['command'], rollout_sources)
+        metrics.update(mixed_metrics)
         with torch.no_grad():
             command = project_task(torch.randn(count, self.options['latent_size'], device=self.device))
             selector = torch.rand(count, 1, device=self.device)
             permutation = torch.randperm(count, device=self.device)
             goals = project_task(self.model.backward(next_state[permutation]))
             command = torch.where(selector < .2, goals, command)
-            command = torch.where((selector >= .2) & (selector < .8), expert_command[permutation], command)
+            reference_command = expert_command[permutation]
+            if self.options.get('mixed_reward_commands', False):
+                reference_command = self.mixed_reward_bank['commands'][2].expand_as(command)
+            command = torch.where((selector >= .2) & (selector < .8), reference_command, command)
             sources = torch.where(selector.squeeze(-1) < .2, 1,
                                   torch.where(selector.squeeze(-1) < .8, 2, 0))
             self._cache_commands(command, sources)
             relabel = torch.rand(count, 1, device=self.device) < self.options['relabel_probability']
             command = torch.where(relabel, command, batch['command'])
+            learner_sources = torch.where(relabel.squeeze(-1), sources, rollout_sources) if rollout_sources is not None else None
             next_action = self._sample_action(next_history, next_state, command, self.options['target_noise_clip'])
             target_forward = self.target(next_critic_state, next_action, command)
             target_backward = self.target.backward(next_state)
@@ -555,8 +975,14 @@ class FBcprAgent(FBAgent):
             parameter.requires_grad_(False)
         actor_loss, q_fb, q_style, q_auxiliary = self._actor_objective(state, history, command)
         probe_every = self.options.get('actor_gradient_probe_every', 0)
-        probe = self._actor_gradient_probe(q_fb, q_style, q_auxiliary) if (
+        probe = self._actor_gradient_probe(q_fb, q_style, q_auxiliary, learner_sources) if (
             probe_every > 0 and self.optimizer_step % probe_every == 0) else None
+        if probe is not None and learner_sources is not None:
+            for source, name in enumerate(self._command_source_names()):
+                source_count = (learner_sources == source).float().sum()
+                if self.world_size > 1:
+                    distributed.all_reduce(source_count)
+                metrics['actor_grad/' + name + '_sample_count'] = source_count
         self.actor_optimizer.zero_grad(set_to_none=True)
         self._backward_loss(actor_loss)
         actor_loss = actor_loss.detach()
@@ -589,6 +1015,8 @@ class FBcprAgent(FBAgent):
         actor_grad = self._step_accumulated_gradients(self.actor_optimizer, self.model.actor.parameters())
         if probe is not None:
             probe_metrics = self._actor_gradient_metrics(*probe)
+            probe_metrics.update({name: value for name, value in metrics.items()
+                                  if name.startswith('actor_grad/')})
             probe_metrics['actor_grad/probe_optimizer_step'] = actor_grad.new_tensor(self.optimizer_step + 1)
             probe_metrics['actor_grad/probe_environment_steps'] = actor_grad.new_tensor(self.frame)
             self.pending_actor_gradient_metrics = probe_metrics
@@ -687,7 +1115,7 @@ class FBcprPlayer(FBcprAgent):
     def run(self):
         self.vec_env.env.cfg["env"]["capture_viewer"] = False
         self.run_started = time.monotonic()
-        self._initialize_rollout()
+        self._initialize_rollout(restore_training=False)
         self.model.eval()
         self._prepare_task_commands()
         returns = torch.zeros(self.num_actors, device=self.device)

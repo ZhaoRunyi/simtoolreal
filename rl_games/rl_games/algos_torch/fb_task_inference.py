@@ -34,6 +34,52 @@ def stage_rewards(components):
     return torch.stack((prelift + penalties, tracking + penalties, components.sum(-1)), -1)
 
 
+@torch.no_grad()
+def mixed_reward_commands(features, components, samples_per_source, evidence=None):
+    """Equal-population signed reward projection; return a gate, never a fallback."""
+    if len(features) != 2 * samples_per_source or len(components) != len(features):
+        raise ValueError('Mixed reward inference requires equal PPO/online counts')
+    features, components = features.float(), components.float()
+    rewards = stage_rewards(components)
+    support = torch.stack((components[:, :4].clamp_min(0).sum(-1),
+                           components[:, [4, 7]].clamp_min(0).sum(-1),
+                           components[:, [0, 2, 3, 4, 7]].clamp_min(0).sum(-1)), -1)
+    contribution_ppo = rewards[:samples_per_source].T @ features[:samples_per_source] / len(features)
+    contribution_online = rewards[samples_per_source:].T @ features[samples_per_source:] / len(features)
+    vectors = contribution_ppo + contribution_online
+    if evidence is not None:
+        evidence.update(ppo_contribution=contribution_ppo, online_contribution=contribution_online)
+    norms = vectors.norm(dim=-1)
+    valid = (torch.isfinite(features).all() & torch.isfinite(components).all()
+             & torch.isfinite(vectors).all() & torch.isfinite(norms).all() & (norms >= 1e-8).all()
+             & (support.sum(0) > 0).all())
+    statistics = {}
+    for index, name in enumerate(stage_names):
+        mass = rewards[:, index].abs()
+        statistics[name + '/norm'] = norms[index]
+        statistics[name + '/reward_mean'] = rewards[:, index].mean()
+        statistics[name + '/positive_task_support'] = support[:, index].sum()
+        statistics[name + '/absolute_reward_ess'] = mass.sum().square() / mass.square().sum().clamp_min(1e-20)
+        for source, section, contribution in (
+            ('ppo', slice(None, samples_per_source), contribution_ppo),
+            ('online', slice(samples_per_source, None), contribution_online),
+        ):
+            statistics[name + '/' + source + '_positive_task_count'] = (support[section, index] > 0).float().sum()
+            statistics[name + '/' + source + '_positive_task_support'] = support[section, index].sum()
+            statistics[name + '/' + source + '_vector_norm'] = contribution[index].norm()
+            statistics[name + '/' + source + '_direction_contribution'] = (
+                contribution[index] * vectors[index]).sum() / norms[index].square().clamp_min(1e-20)
+    for index, name in ((3, 'lift_bonus'), (7, 'success_bonus')):
+        statistics[name + '/positive_count'] = (components[:, index] > 0).float().sum()
+        for source, section in (('ppo', slice(None, samples_per_source)),
+                                ('online', slice(samples_per_source, None))):
+            statistics[name + '/' + source + '_positive_count'] = (components[section, index] > 0).float().sum()
+            statistics[name + '/' + source + '_positive_mass'] = components[section, index].clamp_min(0).sum()
+    # Invalid directions are returned for evidence only. Caller synchronizes
+    # the validity gate across ranks and never uses them to control the policy.
+    return project_task(vectors), statistics, valid
+
+
 def checkpoint_digest(path):
     digest = hashlib.sha256()
     with Path(path).open('rb') as stream:

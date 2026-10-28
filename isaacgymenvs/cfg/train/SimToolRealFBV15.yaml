@@ -1,0 +1,20 @@
+defaults:
+  - SimToolRealFBV4
+  - _self_
+
+params:
+  config:
+    name: ${resolve_default:SimToolRealFBV15,${....experiment}}
+    fb:
+      mixed_reward_commands: true
+      reference_reward_collection: false
+      reward_samples_per_source: 512
+      reward_sampling_seed: 151500
+      reward_sidecar_path: null
+      reward_sidecar_sha256: null
+      reward_sidecar_environment_sha256: null
+      reward_sidecar_seed: null
+      lifted_state_index: 158
+      joint_limit_coefficient: 0.0
+      target_frames: 19120128
+      max_seconds: 21600
