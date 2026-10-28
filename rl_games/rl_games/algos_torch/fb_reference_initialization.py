@@ -3,6 +3,7 @@ import copy
 import hashlib
 import json
 import random
+import time
 from pathlib import Path
 
 import numpy as np
@@ -10,9 +11,10 @@ import torch
 
 from rl_games.algos_torch.fb_reference_audit import digest, require
 from rl_games.algos_torch.fb_reference_quality import asset_manifest, configuration_container
+from rl_games.algos_torch.fb_native_preparation import ACTORS, load_prepared_roots
 
 
-CONTRACT_SHA256 = '4e670398b652318b3e08995557d00f5825184f66dbfe53fb308e7f5a47a6e3a7'
+CONTRACT_SHA256 = 'eb4e57e74754fd2dd666d0be02376f36f4160e4deb2be25fc7801fcd5d3b0019'
 
 
 def state_digest(value):
@@ -166,8 +168,12 @@ def validate_scene(environment, scene, expected):
     require(0 <= constraints['root_atol'] <= 1e-6, 'Nominal pose tolerance must be predeclared and bounded')
     actor_names = ['robot', 'object', 'table_object', 'goal_object']
     require(set(constraints['nominal_root_states']) == set(actor_names), 'All actor construction poses are required')
+    prepared, centers = load_prepared_roots(expected['exact_static_mapping'], constraints['prepared_roots'])
+    require(len(scene['environments']) == len(prepared), 'Native environment row count differs')
     repeated = {}
-    for row in scene['environments']:
+    for index, row in enumerate(scene['environments']):
+        require(row['environment'] == index and row['asset_index'] == index % len(centers),
+                'Native environment/asset mapping differs')
         require(list(row['actors']) == actor_names, 'Actor creation order/count differs')
         body_cursor = 0
         for label, actor in row['actors'].items():
@@ -179,8 +185,21 @@ def validate_scene(environment, scene, expected):
             require(actor['body_env_indices'] == list(range(body_cursor, body_cursor + count)), 'Body env indices differ')
             body_cursor += count
             require(actor['actor_scale'] == 1.0, 'Native actor scale changed')
-            require(np.allclose(actor['initial_root_state'], constraints['nominal_root_states'][label],
-                                rtol=0, atol=constraints['root_atol']), 'Actor not at nominal construction pose: ' + label)
+            actor_offset = ACTORS.index(label)
+            require(actor['actor_sim_index'] == index * len(ACTORS) + actor_offset,
+                    'Native actor simulation mapping differs')
+            # Do not round a perturbed observation down to float32 before checking.
+            observed_root = np.asarray(actor['initial_root_state'], dtype=np.float64)
+            expected_root = prepared[index, actor_offset]
+            require(observed_root.shape == (13,), 'Native root component count differs')
+            mismatch = np.flatnonzero(observed_root != expected_root)
+            require(len(mismatch) == 0,
+                    'Prepared native root differs: environment=' + str(index) + ' actor=' + label +
+                    ' components=' + str(mismatch.tolist()))
+            if label in ('object', 'goal_object'):
+                require(len(actor['rigid_body_properties']) == 1, 'Prepared one-link native body count differs')
+                require(np.array_equal(actor['rigid_body_properties'][0]['com_position'], centers[asset_index]),
+                        'Native COM differs from source URDF: environment=' + str(index) + ' actor=' + label)
             ranges = actor['body_shape_ranges']
             shape_indices = [index for start, count in ranges for index in range(start, start + count)]
             require(shape_indices == list(range(len(actor['shape_properties']))), 'Body-to-shape partition differs')
@@ -235,6 +254,21 @@ def verify_launch_approval(payload, approval):
     require(values == [approval['approval_sha256']], 'Actual approval SHA CLI differs or is duplicated')
 
 
+def _persist_native_failure(agent, stage, scene, before, error, expected=None):
+    """Preserve the observed failed scene; never emit a successful receipt."""
+    path = agent.output_dir / ('initialization_failed.rank' + str(agent.global_rank) +
+                              '.' + str(time.time_ns()) + '.json')
+    payload = {'status': 'FAILED_NATIVE_INITIALIZATION', 'stage': stage,
+               'rank': agent.global_rank, 'frame': agent.frame, 'optimizer_step': agent.optimizer_step,
+               'frame_since_restart': agent.vec_env.env.frame_since_restart,
+               'contract_sha256': CONTRACT_SHA256, 'error': repr(error),
+               'expected': expected, 'before': before, 'after': visible_snapshot(agent),
+               'runtime_observed_scene': scene, 'historical_full_state_available': False}
+    with path.open('x') as stream:
+        json.dump(payload, stream)
+    return path
+
+
 def begin_loader_check(agent, approval):
     """Fail before loading/sampling if the approved launch/scene differs."""
     require(agent.frame == agent.optimizer_step == agent.epoch_num == 0,
@@ -256,9 +290,14 @@ def begin_loader_check(agent, approval):
     before = visible_snapshot(agent)
     scene = capture_scene(agent.vec_env.env)
     expected = report['expected_scenes'][agent.global_rank]
-    require(digest(expected['path']) == expected['sha256'], 'Expected scene provenance changed')
-    expected_scene = json.loads(Path(expected['path']).read_text())
-    validate_scene(agent.vec_env.env, scene, expected_scene)
+    try:
+        require(digest(expected['path']) == expected['sha256'], 'Expected scene provenance changed')
+        expected_scene = json.loads(Path(expected['path']).read_text())
+        validate_scene(agent.vec_env.env, scene, expected_scene)
+    except Exception as error:
+        _persist_native_failure(agent, 'before_reference_loader', scene, before, error,
+                                {'scene': expected, 'approval_sha256': approval['approval_sha256']})
+        raise
     # Freeze native observations before any data-conditioned command or update.
     output = agent.output_dir / ('initialization.rank' + str(agent.global_rank) + '.json')
     require(not output.exists(), 'Preserve earlier initialization record; do not overwrite a fresh-run identity')
@@ -268,12 +307,17 @@ def begin_loader_check(agent, approval):
 
 def finish_loader_check(agent, check, reference, reset_bank):
     scene_after = capture_scene(agent.vec_env.env)
-    require(state_digest(scene_after) == check['scene_sha256'], 'Quality loading changed native scene properties')
-    after = visible_snapshot(agent)
-    require(after == check['before'], 'Quality loading changed non-intervention visible state/RNG')
-    original = torch.load(reset_bank, map_location='cpu')
-    require(state_digest(agent.vec_env.env.reference_reset_bank) == state_digest(original['resets']),
-            'Loaded reset bank values differ from immutable original')
+    try:
+        require(state_digest(scene_after) == check['scene_sha256'], 'Quality loading changed native scene properties')
+        after = visible_snapshot(agent)
+        require(after == check['before'], 'Quality loading changed non-intervention visible state/RNG')
+        original = torch.load(reset_bank, map_location='cpu')
+        require(state_digest(agent.vec_env.env.reference_reset_bank) == state_digest(original['resets']),
+                'Loaded reset bank values differ from immutable original')
+    except Exception as error:
+        _persist_native_failure(agent, 'after_reference_loader', scene_after, check['before'], error,
+                                {'scene_sha256': check['scene_sha256'], 'approval_sha256': check['approval_sha256']})
+        raise
     report = {'status': 'PASS_CURRENT_LOADER_NO_SIDE_EFFECTS', 'contract_sha256': CONTRACT_SHA256,
               'historical_full_state_available': False, 'rank': agent.global_rank,
               'before': check['before'], 'after': after, 'scene_sha256': check['scene_sha256'],
